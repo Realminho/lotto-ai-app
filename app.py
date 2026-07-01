@@ -1,6 +1,8 @@
 import os
 import random
 import time
+import json
+import re
 from collections import Counter
 from datetime import date
 from typing import Dict, List, Optional, Tuple
@@ -35,7 +37,7 @@ REQUEST_HEADERS = {
 }
 
 st.set_page_config(
-    page_title="통계 추천형 AI 로또 번호 분석/생성기 v6",
+    page_title="통계 추천형 AI 로또 번호 분석/생성기 v7",
     page_icon="🎲",
     layout="wide",
 )
@@ -691,45 +693,366 @@ def generate_statistical_recommendations(
     return reco_df, stats_df, profile
 
 
-def ask_nvidia_stat_ai(api_key, reco_df, stats_df, latest_draw, verification_status, recent_window):
+
+def combo_numbers_from_reco_row(row: Dict) -> List[int]:
+    nums = []
+    for i in range(1, 7):
+        n = safe_int(row.get(f"번호{i}"))
+        if n is not None:
+            nums.append(int(n))
+    return sorted(nums)
+
+
+def make_combo_numeric_detail_df(reco_df: pd.DataFrame, stats_df: pd.DataFrame, recent_window: int) -> pd.DataFrame:
+    """추천 조합별 수치 설명용 요약표"""
+    if reco_df is None or reco_df.empty or stats_df is None or stats_df.empty:
+        return pd.DataFrame()
+
+    recent_col = f"최근{recent_window}회출현횟수"
+    stat_index = stats_df.set_index("번호")
+    rows = []
+    for _, row in reco_df.iterrows():
+        nums = combo_numbers_from_reco_row(row.to_dict())
+        selected = stat_index.loc[[n for n in nums if n in stat_index.index]].copy()
+        if selected.empty:
+            continue
+        rows.append({
+            "추천순위": safe_int(row.get("추천순위"), 0),
+            "조합": "-".join(map(str, nums)),
+            "조합통계점수": row.get("조합통계점수", 0),
+            "번호평균통계점수": round(float(selected["통계점수"].mean()), 2),
+            "장기빈도점수평균": round(float(selected["장기빈도점수"].mean()), 2),
+            "최근흐름점수평균": round(float(selected["최근흐름점수"].mean()), 2),
+            "미출현간격점수평균": round(float(selected["미출현간격점수"].mean()), 2),
+            "보너스점수평균": round(float(selected["보너스점수"].mean()), 2),
+            "전체당첨횟수합": int(selected["전체당첨횟수"].sum()) if "전체당첨횟수" in selected.columns else 0,
+            f"최근{recent_window}회출현합": int(selected[recent_col].sum()) if recent_col in selected.columns else 0,
+            "평균미출현간격비율": round(float(selected["미출현간격비율"].mean()), 2) if "미출현간격비율" in selected.columns else 0,
+            "합계": row.get("합계", 0),
+            "홀짝": row.get("홀짝", ""),
+            "저고": row.get("저고", ""),
+            "연속번호쌍": row.get("연속번호쌍", 0),
+            "끝자리최대중복": row.get("끝자리최대중복", 0),
+        })
+    return pd.DataFrame(rows)
+
+
+def make_number_numeric_detail_df(reco_df: pd.DataFrame, stats_df: pd.DataFrame, recent_window: int) -> pd.DataFrame:
+    """추천 조합에 들어간 개별 번호의 수치 근거표"""
+    if reco_df is None or reco_df.empty or stats_df is None or stats_df.empty:
+        return pd.DataFrame()
+
+    recent_col = f"최근{recent_window}회출현횟수"
+    keep_cols = [
+        "번호", "통계점수", "전체당첨횟수", "전체출현률", recent_col,
+        f"최근{recent_window}회기대대비", "마지막출현후경과회차", "평균출현간격", "미출현간격비율",
+        "장기빈도점수", "최근흐름점수", "미출현간격점수", "보너스점수",
+    ]
+    available_cols = [c for c in keep_cols if c in stats_df.columns]
+    stat_index = stats_df.set_index("번호")
+    rows = []
+    for _, row in reco_df.iterrows():
+        rank = safe_int(row.get("추천순위"), 0)
+        combo = "-".join(map(str, combo_numbers_from_reco_row(row.to_dict())))
+        for n in combo_numbers_from_reco_row(row.to_dict()):
+            if n not in stat_index.index:
+                continue
+            d = stat_index.loc[n].to_dict()
+            one = {"추천순위": rank, "조합": combo, "번호": n}
+            for c in available_cols:
+                if c != "번호":
+                    one[c] = d.get(c)
+            rows.append(one)
+    return pd.DataFrame(rows)
+
+
+def check_nvidia_api_status(api_key: str) -> Tuple[bool, str]:
+    """NVIDIA API 키가 정상인지 짧게 확인"""
+    if not api_key or api_key == "YOUR_API_KEY":
+        return False, "API 키가 입력되지 않았습니다. Streamlit Secrets 또는 왼쪽 입력칸에 NVIDIA_API_KEY를 넣어주세요."
+    try:
+        client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[{"role": "user", "content": "정상 연결이면 OK라고만 답해."}],
+            temperature=0,
+            max_tokens=10,
+        )
+        text = response.choices[0].message.content or ""
+        return True, f"정상 연결됨: {text.strip()}"
+    except Exception as e:
+        msg = str(e)
+        lower = msg.lower()
+        if "401" in msg or "unauthorized" in lower or "invalid" in lower:
+            return False, "API 키 인증 실패로 보입니다. NVIDIA에서 새 API 키를 발급한 뒤 Streamlit Secrets에 직접 저장해야 합니다. 앱이 자동으로 재발급하거나 Secrets를 수정할 수는 없습니다.\n\n오류: " + msg
+        if "403" in msg or "forbidden" in lower:
+            return False, "권한 또는 모델 접근 제한 오류로 보입니다. NVIDIA 계정/모델 접근 권한을 확인하세요.\n\n오류: " + msg
+        if "429" in msg or "rate" in lower or "quota" in lower:
+            return False, "사용량 제한 또는 호출 제한으로 보입니다. 잠시 후 다시 시도하거나 NVIDIA 계정의 사용량 한도를 확인하세요.\n\n오류: " + msg
+        return False, "NVIDIA API 호출 중 오류가 발생했습니다.\n\n오류: " + msg
+
+
+def ask_nvidia_stat_ai(api_key, reco_df, stats_df, latest_draw, verification_status, recent_window, combo_profile=None):
     if not api_key or api_key == "YOUR_API_KEY":
         return "NVIDIA API 키가 설정되지 않았습니다. Streamlit Secrets에 NVIDIA_API_KEY를 넣거나 왼쪽 입력창에 키를 입력해주세요."
 
     client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
-    reco_text = reco_df.head(5).to_string(index=False)
-    top_text = stats_df.head(15).to_string(index=False)
+    reco_text = reco_df.head(8).to_string(index=False)
+    top_text = stats_df.head(20).to_string(index=False)
+    combo_detail_df = make_combo_numeric_detail_df(reco_df.head(8), stats_df, recent_window)
+    number_detail_df = make_number_numeric_detail_df(reco_df.head(5), stats_df, recent_window)
+    combo_detail_text = combo_detail_df.to_string(index=False) if not combo_detail_df.empty else "없음"
+    number_detail_text = number_detail_df.to_string(index=False) if not number_detail_df.empty else "없음"
+    profile = combo_profile or {}
 
     prompt = f"""
-아래는 로또 통계 추천 결과야.
+너는 로또 번호를 '통계적으로 설명만 하는' 분석 보조 AI야.
+아래 수치표를 근거로 한국어로 자세히 설명해줘.
+절대 당첨 보장, 당첨 확률 상승 확정, 예측 성공 같은 표현은 쓰면 안 돼.
 
-최신 반영 회차: {latest_draw}회
-데이터 검증 상태: {verification_status}
-최근 분석 회차 수: {recent_window}회
-추천 조합:
+[기본 정보]
+- 최신 반영 회차: {latest_draw}회
+- 데이터 검증 상태: {verification_status}
+- 최근 흐름 분석 범위: 최근 {recent_window}회
+- 과거 조합 합계 IQR: Q25={profile.get('sum_q25', 'NA')}, Q75={profile.get('sum_q75', 'NA')}
+- 과거 조합 합계 넓은 범위: Q10={profile.get('sum_q10', 'NA')}, Q90={profile.get('sum_q90', 'NA')}
+- 자주 나타난 홀수 개수 패턴: {profile.get('common_odd_counts', [])}
+- 자주 나타난 저번호 개수 패턴: {profile.get('common_low_counts', [])}
+
+[추천 조합 원본표]
 {reco_text}
 
-번호별 통계점수 상위 일부:
+[조합별 수치 요약표]
+{combo_detail_text}
+
+[추천 조합에 포함된 개별 번호 수치표]
+{number_detail_text}
+
+[번호별 통계점수 상위 20개]
 {top_text}
 
-요청:
-1. 추천 조합이 어떤 통계 기준으로 나온 것인지 짧게 설명해줘.
-2. 장기 빈도, 최근 흐름, 미출현 간격, 조합 균형을 반영했다고 설명해줘.
-3. 절대 당첨 가능성이 높다고 단정하지 말고, 로또는 독립 무작위 추첨이라 통계가 당첨을 보장하지 않는다고 말해줘.
-4. 5문장 이내로 작성해줘.
+설명 형식:
+1. 먼저 '분석 요약'을 2~3문장으로 작성.
+2. 그 다음 추천 1~3순위 조합별로 아래 항목을 반드시 수치와 함께 설명.
+   - 조합통계점수
+   - 번호평균통계점수
+   - 장기빈도점수평균
+   - 최근흐름점수평균
+   - 미출현간격점수평균
+   - 전체당첨횟수합
+   - 최근 {recent_window}회 출현합
+   - 합계, 홀짝, 저고, 연속번호쌍
+3. 마지막에는 '주의' 문단을 넣고 로또는 독립 무작위 추첨이라 이 분석이 당첨을 보장하지 않는다고 명확히 말해.
+4. 숫자는 표에 있는 값을 그대로 사용하고, 없는 값은 추측하지 마.
 """
     try:
         response = client.chat.completions.create(
             model=NVIDIA_MODEL,
             messages=[
-                {"role": "system", "content": "너는 복권 통계를 신중하게 설명하는 한국어 AI 도우미다. 당첨 보장 표현은 금지한다."},
+                {"role": "system", "content": "너는 복권 통계를 신중하고 수치적으로 설명하는 한국어 통계 분석 보조 AI다. 당첨 보장 표현은 금지한다."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.35,
-            max_tokens=700,
+            temperature=0.25,
+            max_tokens=1800,
         )
         return response.choices[0].message.content
     except Exception as e:
         return f"NVIDIA API 호출 중 오류가 발생했습니다.\n\n오류 내용: {e}"
+
+
+def parse_ai_combo_response(text: str) -> Tuple[List[Dict], Optional[str]]:
+    """AI가 반환한 JSON에서 조합 추출"""
+    if not text:
+        return [], "응답이 비어 있습니다."
+    candidates = []
+    raw = text.strip()
+    blocks = re.findall(r"```(?:json)?\s*(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
+    parse_targets = blocks + [raw]
+    for target in parse_targets:
+        target = target.strip()
+        try:
+            obj = json.loads(target)
+        except Exception:
+            # 텍스트 중 배열 또는 객체 부분만 추출 시도
+            m = re.search(r"(\{.*\}|\[.*\])", target, flags=re.DOTALL)
+            if not m:
+                continue
+            try:
+                obj = json.loads(m.group(1))
+            except Exception:
+                continue
+        if isinstance(obj, dict):
+            if isinstance(obj.get("recommendations"), list):
+                candidates = obj["recommendations"]
+            elif isinstance(obj.get("combinations"), list):
+                candidates = obj["combinations"]
+            elif isinstance(obj.get("조합"), list):
+                candidates = obj["조합"]
+            else:
+                candidates = [obj]
+        elif isinstance(obj, list):
+            candidates = obj
+        if candidates:
+            break
+    if not candidates:
+        return [], "AI 응답에서 JSON 조합을 찾지 못했습니다."
+    return candidates, None
+
+
+def normalize_ai_combo_items(items: List[Dict]) -> List[Dict]:
+    """AI 조합 응답을 검증 가능한 형태로 정리"""
+    cleaned = []
+    seen = set()
+    for item in items:
+        if isinstance(item, dict):
+            nums = item.get("numbers") or item.get("번호") or item.get("combination") or item.get("조합")
+            strategy = item.get("strategy") or item.get("전략") or "AI 통계 조합"
+            reason = item.get("reason") or item.get("이유") or item.get("설명") or "AI가 통계표를 참고해 구성한 조합"
+        elif isinstance(item, list):
+            nums = item
+            strategy = "AI 통계 조합"
+            reason = "AI가 통계표를 참고해 구성한 조합"
+        else:
+            continue
+        try:
+            nums = sorted([int(x) for x in nums])
+        except Exception:
+            continue
+        if len(nums) != 6 or len(set(nums)) != 6:
+            continue
+        if any(n < 1 or n > 45 for n in nums):
+            continue
+        t = tuple(nums)
+        if t in seen:
+            continue
+        seen.add(t)
+        cleaned.append({"numbers": nums, "strategy": str(strategy), "reason": str(reason)})
+    return cleaned
+
+
+def ai_items_to_reco_df(items: List[Dict], stats_df: pd.DataFrame, profile: Dict, recent_window: int) -> pd.DataFrame:
+    score_map = stats_df.set_index("번호")["통계점수"].to_dict()
+    rows = []
+    for item in items:
+        nums = sorted(item["numbers"])
+        score, details = evaluate_statistical_combo(nums, score_map, profile)
+        numeric_reason = build_combo_reason(nums, stats_df, recent_window)
+        rows.append({
+            "추천순위": 0,
+            "번호1": nums[0],
+            "번호2": nums[1],
+            "번호3": nums[2],
+            "번호4": nums[3],
+            "번호5": nums[4],
+            "번호6": nums[5],
+            "조합통계점수": score,
+            "합계": details["합계"],
+            "홀짝": f"{details['홀수개수']}:{details['짝수개수']}",
+            "저고": f"{details['저번호개수']}:{details['고번호개수']}",
+            "연속번호쌍": details["연속번호쌍"],
+            "끝자리최대중복": details["같은끝자리최대"],
+            "AI전략": item.get("strategy", "AI 통계 조합"),
+            "AI추천이유": item.get("reason", ""),
+            "수치추천이유": numeric_reason,
+        })
+    df = pd.DataFrame(rows).sort_values("조합통계점수", ascending=False).reset_index(drop=True)
+    if not df.empty:
+        df["추천순위"] = range(1, len(df) + 1)
+    return df
+
+
+def ask_nvidia_make_recommendations(
+    api_key: str,
+    stats_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    profile: Dict,
+    latest_draw: int,
+    verification_status: str,
+    recent_window: int,
+    recommend_count: int,
+    candidate_pool_size: int,
+) -> Tuple[pd.DataFrame, str]:
+    """AI가 통계표를 보고 직접 조합을 만들게 한 뒤, 앱에서 다시 검증/점수화"""
+    if not api_key or api_key == "YOUR_API_KEY":
+        return pd.DataFrame(), "NVIDIA API 키가 설정되지 않았습니다."
+
+    top_df = stats_df.head(int(candidate_pool_size)).copy()
+    top_cols = [
+        "번호", "통계점수", "전체당첨횟수", "전체출현률", f"최근{recent_window}회출현횟수",
+        f"최근{recent_window}회기대대비", "마지막출현후경과회차", "평균출현간격", "미출현간격비율",
+        "장기빈도점수", "최근흐름점수", "미출현간격점수", "보너스점수",
+    ]
+    top_cols = [c for c in top_cols if c in top_df.columns]
+    top_text = top_df[top_cols].to_string(index=False)
+
+    recent_rows = []
+    for _, row in history_df.sort_values("회차", ascending=False).head(15).iterrows():
+        recent_rows.append({
+            "회차": int(row["회차"]),
+            "번호": extract_main_numbers(row.to_dict()),
+            "보너스": int(row["보너스"]),
+        })
+
+    prompt = f"""
+너는 로또 통계표를 읽고 참고용 조합을 구성하는 AI야.
+당첨을 예측하거나 보장하면 안 된다. 통계적으로 균형 있는 참고 조합만 만들어라.
+
+[조건]
+- 만들어야 할 조합 수: {int(recommend_count)}개
+- 각 조합은 1~45 사이 정수 6개
+- 한 조합 안에서 중복 금지
+- 가능하면 아래 통계점수 상위 {int(candidate_pool_size)}개 번호를 중심으로 구성
+- 모든 조합이 너무 비슷하지 않게 분산
+- 합계는 과거 IQR(Q25~Q75) 근처를 우선 고려하되, 무리하게 맞추지 않음
+- 홀짝은 2:4, 3:3, 4:2 중심
+- 저번호(1~22)와 고번호(23~45)는 2:4, 3:3, 4:2 중심
+- 연속번호쌍은 0~1개 정도를 선호
+- 같은 끝자리 숫자는 한 조합 안에서 2개 이하를 선호
+
+[기본 정보]
+최신 반영 회차: {latest_draw}회
+데이터 검증 상태: {verification_status}
+최근 흐름 분석 범위: 최근 {recent_window}회
+과거 조합 합계 IQR: Q25={profile.get('sum_q25', 'NA')}, Q75={profile.get('sum_q75', 'NA')}
+자주 나타난 홀수 개수 패턴: {profile.get('common_odd_counts', [])}
+자주 나타난 저번호 개수 패턴: {profile.get('common_low_counts', [])}
+
+[최근 15회 결과]
+{json.dumps(recent_rows, ensure_ascii=False)}
+
+[번호별 통계점수 상위표]
+{top_text}
+
+반드시 아래 JSON 형식만 출력해라. JSON 밖에 설명 문장을 쓰지 마라.
+{{
+  "recommendations": [
+    {{"numbers": [1, 2, 3, 4, 5, 6], "strategy": "전략명", "reason": "수치 기준을 반영한 짧은 이유"}}
+  ]
+}}
+"""
+    try:
+        client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[
+                {"role": "system", "content": "너는 JSON만 출력하는 통계 조합 생성기다. 당첨 보장 표현은 금지한다."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.55,
+            max_tokens=1600,
+        )
+        raw_text = response.choices[0].message.content or ""
+        items, err = parse_ai_combo_response(raw_text)
+        if err:
+            return pd.DataFrame(), err + "\n\n원본 응답:\n" + raw_text
+        cleaned = normalize_ai_combo_items(items)
+        if not cleaned:
+            return pd.DataFrame(), "AI가 만든 조합이 검증 규칙을 통과하지 못했습니다. 다시 시도해보세요.\n\n원본 응답:\n" + raw_text
+        df = ai_items_to_reco_df(cleaned, stats_df, profile, recent_window)
+        return df, raw_text
+    except Exception as e:
+        return pd.DataFrame(), f"NVIDIA API 호출 중 오류가 발생했습니다.\n\n오류 내용: {e}"
+
 
 def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, verification_status):
     if not api_key or api_key == "YOUR_API_KEY":
@@ -772,7 +1095,7 @@ def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, verification
 # =========================================================
 # 화면
 # =========================================================
-st.title("🎲 통계 추천형 AI 로또 번호 분석/생성기 v6")
+st.title("🎲 통계 추천형 AI 로또 번호 분석/생성기 v7")
 st.write("mirror 데이터를 빠르게 불러오고 내부 무결성 검사를 기본 적용합니다. 공식 API 검증은 동행복권 사이트가 클라우드 접속을 차단할 수 있어 선택 기능으로 제공합니다.")
 
 st.warning(
@@ -810,6 +1133,17 @@ with st.sidebar:
         help="Streamlit Secrets에 넣었다면 비워도 됩니다.",
     )
     final_api_key = input_api_key or NVIDIA_API_KEY
+
+    if st.button("NVIDIA API 키 상태 확인"):
+        ok, status_msg = check_nvidia_api_status(final_api_key)
+        if ok:
+            st.success(status_msg)
+        else:
+            st.error(status_msg)
+
+    with st.expander("Secrets 입력 형식 보기"):
+        st.code('NVIDIA_API_KEY = "nvapi-여기에_새_API키"', language="toml")
+        st.write("실행 중인 앱은 Streamlit Cloud Secrets를 자동으로 수정할 수 없습니다. 새 키를 발급받은 뒤 Streamlit 앱 Settings → Secrets에 직접 저장하고 Reboot하세요.")
 
     if st.button("앱 캐시 새로고침"):
         st.cache_data.clear()
@@ -1106,6 +1440,20 @@ with tab5:
             "5. 조합 균형: 과거 조합의 합계 범위, 홀짝 비율, 저번호/고번호 비율, 연속번호 과다 여부, 끝자리 쏠림을 함께 봅니다."
         )
 
+    st.subheader("AI 직접 조합 생성 옵션")
+    ai_c1, ai_c2 = st.columns(2)
+    with ai_c1:
+        ai_candidate_pool = st.slider(
+            "AI가 참고할 통계점수 상위 번호 개수",
+            min_value=12,
+            max_value=45,
+            value=28,
+            step=1,
+            help="AI에게 번호별 통계표를 보여줄 범위입니다. 너무 좁으면 조합이 비슷해질 수 있습니다.",
+        )
+    with ai_c2:
+        ai_recommend_count = st.number_input("AI가 직접 만들 추천 조합 개수", min_value=1, max_value=10, value=5, step=1)
+
     if st.button("📈 통계 추천 조합 만들기", type="primary"):
         with st.spinner("여러 후보 조합을 만들고 통계 점수로 정렬하는 중입니다..."):
             reco_df, stat_score_df, combo_profile = generate_statistical_recommendations(
@@ -1126,9 +1474,63 @@ with tab5:
             st.session_state["stat_recent_window"] = int(recent_window)
             st.session_state["combo_profile"] = combo_profile
 
+    if st.button("🤖 AI가 직접 추천 조합 만들기"):
+        with st.spinner("NVIDIA AI가 통계표를 읽고 직접 조합을 만드는 중입니다..."):
+            stat_score_df = make_statistical_score_table(
+                history_df=history_df,
+                count_df=count_df,
+                recent_window=int(recent_window),
+                weight_total=int(weight_total),
+                weight_recent=int(weight_recent),
+                weight_gap=int(weight_gap),
+                weight_bonus=int(weight_bonus),
+            )
+            combo_profile = make_historical_combo_profile(history_df)
+            ai_reco_df, ai_raw = ask_nvidia_make_recommendations(
+                api_key=final_api_key,
+                stats_df=stat_score_df,
+                history_df=history_df,
+                profile=combo_profile,
+                latest_draw=latest_draw,
+                verification_status=verification_status,
+                recent_window=int(recent_window),
+                recommend_count=int(ai_recommend_count),
+                candidate_pool_size=int(ai_candidate_pool),
+            )
+            if ai_reco_df.empty:
+                st.error(ai_raw)
+            else:
+                st.session_state["ai_reco_df"] = ai_reco_df
+                st.session_state["ai_raw_response"] = ai_raw
+                st.session_state["reco_df"] = ai_reco_df
+                st.session_state["stat_score_df"] = stat_score_df
+                st.session_state["stat_recent_window"] = int(recent_window)
+                st.session_state["combo_profile"] = combo_profile
+                st.success("AI가 만든 조합을 앱에서 다시 검증하고 통계점수로 정렬했습니다.")
+
     if "reco_df" in st.session_state:
         st.subheader("추천 조합")
         st.dataframe(st.session_state["reco_df"], use_container_width=True, hide_index=True)
+
+        if "AI전략" in st.session_state["reco_df"].columns:
+            with st.expander("AI 원본 응답 보기"):
+                st.code(st.session_state.get("ai_raw_response", ""))
+
+        st.subheader("조합별 수치 요약")
+        numeric_combo_df = make_combo_numeric_detail_df(
+            st.session_state["reco_df"],
+            st.session_state["stat_score_df"],
+            st.session_state["stat_recent_window"],
+        )
+        st.dataframe(numeric_combo_df, use_container_width=True, hide_index=True)
+
+        with st.expander("추천 조합 개별 번호 수치 근거 보기"):
+            numeric_number_df = make_number_numeric_detail_df(
+                st.session_state["reco_df"],
+                st.session_state["stat_score_df"],
+                st.session_state["stat_recent_window"],
+            )
+            st.dataframe(numeric_number_df, use_container_width=True, hide_index=True)
 
         st.subheader("번호별 통계점수 상위 15개")
         st.dataframe(st.session_state["stat_score_df"].head(15), use_container_width=True, hide_index=True)
@@ -1151,8 +1553,9 @@ with tab5:
                     latest_draw=latest_draw,
                     verification_status=verification_status,
                     recent_window=st.session_state["stat_recent_window"],
+                    combo_profile=st.session_state.get("combo_profile", {}),
                 )
-            st.subheader("🤖 AI 설명")
+            st.subheader("🤖 수치형 통계 AI 설명")
             st.write(ai_comment)
 
 with tab6:
