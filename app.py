@@ -15,7 +15,12 @@ from openai import OpenAI
 # =========================================================
 # Put your NVIDIA API key here.
 # Example: NVIDIA_API_KEY = "nvapi-xxxxxxxxxxxxxxxx"
-NVIDIA_API_KEY = "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"
+import os
+
+try:
+    NVIDIA_API_KEY = st.secrets.get("NVIDIA_API_KEY", "YOUR_API_KEY")
+except Exception:
+    NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "YOUR_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = "minimaxai/minimax-m3"
 
