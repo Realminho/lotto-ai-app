@@ -35,7 +35,7 @@ REQUEST_HEADERS = {
 }
 
 st.set_page_config(
-    page_title="통계 추천형 AI 로또 번호 분석/생성기",
+    page_title="통계 추천형 AI 로또 번호 분석/생성기 v6",
     page_icon="🎲",
     layout="wide",
 )
@@ -772,8 +772,8 @@ def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, verification
 # =========================================================
 # 화면
 # =========================================================
-st.title("🎲 통계 추천형 AI 로또 번호 분석/생성기")
-st.write("mirror 데이터를 빠르게 불러온 뒤 공식값과 비교해 신뢰도를 표시하고, 최근 결과와 통계 점수를 조합해 추천 번호를 만듭니다.")
+st.title("🎲 통계 추천형 AI 로또 번호 분석/생성기 v6")
+st.write("mirror 데이터를 빠르게 불러오고 내부 무결성 검사를 기본 적용합니다. 공식 API 검증은 동행복권 사이트가 클라우드 접속을 차단할 수 있어 선택 기능으로 제공합니다.")
 
 st.warning(
     "로또는 무작위 추첨입니다. 과거 당첨횟수는 미래 당첨을 보장하지 않습니다. "
@@ -786,19 +786,20 @@ with st.sidebar:
     data_mode = st.radio(
         "데이터 불러오기 방식",
         [
-            "빠른 모드 + 공식 검증 추천",
-            "GitHub mirror만 사용",
+            "GitHub mirror + 내부 무결성 검사 추천",
+            "GitHub mirror + 공식 API 검증 시도 느림",
             "동행복권 공식 API만 사용 매우 느림",
         ],
         index=0,
+        help="Streamlit Cloud에서는 동행복권 공식 API가 HTML 대기/차단 페이지를 반환할 수 있어, 기본은 빠른 mirror + 내부 검사로 설정했습니다.",
     )
 
     verify_count = st.slider(
         "공식 API와 비교할 최신 회차 수",
         min_value=1,
         max_value=10,
-        value=5,
-        help="숫자가 클수록 신뢰도 확인은 강해지지만, 공식 API가 막힌 환경에서는 느려질 수 있습니다.",
+        value=3,
+        help="공식 검증 시도 모드에서만 사용됩니다. 숫자가 클수록 느려질 수 있고, 공식 API가 막힌 환경에서는 검증 불가로 표시됩니다.",
     )
 
     st.divider()
@@ -821,7 +822,7 @@ history_df = pd.DataFrame()
 source_note = ""
 
 with st.spinner("로또 데이터를 불러오는 중입니다..."):
-    if data_mode in ["빠른 모드 + 공식 검증 추천", "GitHub mirror만 사용"]:
+    if data_mode in ["GitHub mirror + 내부 무결성 검사 추천", "GitHub mirror + 공식 API 검증 시도 느림"]:
         history_df, load_error = fetch_mirror_all()
         if history_df.empty:
             latest_row, latest_err = fetch_mirror_latest()
@@ -854,7 +855,7 @@ comparison_df = pd.DataFrame()
 verified_draws = []
 verify_error = None
 
-if data_mode == "빠른 모드 + 공식 검증 추천":
+if data_mode == "GitHub mirror + 공식 API 검증 시도 느림":
     with st.spinner(f"최신 {verify_count}개 회차를 공식 API와 비교하는 중입니다..."):
         verification_status, comparison_df, verified_draws, verify_error = verify_with_official(history_df, verify_count)
 elif data_mode == "동행복권 공식 API만 사용 매우 느림":
@@ -885,7 +886,7 @@ if verification_status == "공식 검증 통과":
 elif verification_status == "공식값과 불일치 발견":
     st.error("mirror 데이터와 동행복권 공식 조회값이 다른 회차가 있습니다. 번호 생성 전 검증 상태 탭을 확인하세요.")
 elif verification_status in ["검증 불가", "일부만 검증됨"]:
-    st.warning("공식 API 접근이 일부 실패했거나 막혀서 완전 검증은 못 했습니다. 최신 번호는 동행복권 공식 사이트에서 최종 확인하세요.")
+    st.warning("동행복권 공식 API가 Streamlit Cloud 접속에 HTML 대기/차단 페이지를 반환해 공식 검증을 완료하지 못했습니다. mirror 데이터가 틀렸다는 뜻은 아니며, 기본 무결성 검사와 통계 기능은 계속 사용할 수 있습니다.")
     if verify_error:
         with st.expander("공식 검증 실패 사유 보기"):
             st.code(verify_error)
@@ -907,14 +908,14 @@ with tab1:
     st.dataframe(integrity_df, use_container_width=True, hide_index=True)
 
     st.subheader("2. 공식 API 비교 검사")
-    if data_mode == "빠른 모드 + 공식 검증 추천":
+    if data_mode == "GitHub mirror + 공식 API 검증 시도 느림":
         st.write(f"최신 {verify_count}개 회차를 동행복권 공식 조회값과 비교했습니다.")
         if not comparison_df.empty:
             st.dataframe(comparison_df, use_container_width=True, hide_index=True)
         else:
             st.info("비교 결과가 없습니다.")
-    elif data_mode == "GitHub mirror만 사용":
-        st.info("현재는 mirror만 사용 중이라 공식 비교 검증을 생략했습니다. 왼쪽 설정에서 '빠른 모드 + 공식 검증 추천'을 선택하면 비교합니다.")
+    elif data_mode == "GitHub mirror + 내부 무결성 검사 추천":
+        st.info("현재는 빠른 mirror 모드라 공식 비교 검증을 생략했습니다. 왼쪽 설정에서 'GitHub mirror + 공식 API 검증 시도 느림'을 선택하면 비교합니다. 단, Streamlit Cloud에서는 공식 API가 막혀 검증 불가가 뜰 수 있습니다.")
     else:
         st.info("공식 API만 사용 중입니다. 다만 전체 회차를 공식 API로 불러오는 방식은 매우 느릴 수 있습니다.")
 
