@@ -1,9 +1,9 @@
-import json
+import os
 import random
-import socket
 import time
 from collections import Counter
-from pathlib import Path
+from datetime import date
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -11,307 +11,363 @@ import streamlit as st
 from openai import OpenAI
 
 # =========================================================
-# NVIDIA API SETTINGS
+# NVIDIA API 설정
+# - Streamlit Cloud에서는 Secrets에 NVIDIA_API_KEY를 넣으세요.
+# - 로컬 실행만 할 때는 아래 YOUR_API_KEY를 직접 바꿔도 됩니다.
 # =========================================================
-# Put your NVIDIA API key here.
-# Example: NVIDIA_API_KEY = "nvapi-xxxxxxxxxxxxxxxx"
-import os
-
 try:
     NVIDIA_API_KEY = st.secrets.get("NVIDIA_API_KEY", "YOUR_API_KEY")
 except Exception:
     NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "YOUR_API_KEY")
+
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = "minimaxai/minimax-m3"
 
-# =========================================================
-# LOTTO DATA SOURCES
-# =========================================================
-# Main source: GitHub Pages JSON mirror of Lotto 6/45 results.
-# Fallback source: official DH Lottery per-draw API. The official site can return an HTML waiting/block page.
+OFFICIAL_API_URL = "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={draw_no}"
 MIRROR_ALL_URL = "https://smok95.github.io/lotto/results/all.json"
 MIRROR_LATEST_URL = "https://smok95.github.io/lotto/results/latest.json"
-MIRROR_ONE_URL = "https://smok95.github.io/lotto/results/{draw_no}.json"
-OFFICIAL_ONE_URL = "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={draw_no}"
-CACHE_FILE = Path("lotto_history_cache.csv")
+MIRROR_DRAW_URL = "https://smok95.github.io/lotto/results/{draw_no}.json"
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://www.dhlottery.co.kr/",
 }
 
-st.set_page_config(page_title="AI Lotto Number Generator", page_icon="🎲", layout="wide")
+st.set_page_config(
+    page_title="통계 추천형 AI 로또 번호 분석/생성기",
+    page_icon="🎲",
+    layout="wide",
+)
 
 
-def get_local_ip():
-    """Return local IP for phone access on the same Wi-Fi."""
+# =========================================================
+# 공통 유틸
+# =========================================================
+def safe_int(value, default=None):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        if pd.isna(value):
+            return default
+        return int(value)
     except Exception:
-        return "IP check failed"
+        return default
 
 
-def safe_request_json(url: str, timeout: int = 15):
-    """Request JSON. If HTML/waiting page is returned, raise a readable error."""
-    response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
-    response.raise_for_status()
-
-    text = response.text.strip()
-    if not text:
-        raise ValueError(f"Empty response from {url}")
-
-    first_char = text[:1]
-    if first_char not in ["{", "["]:
-        preview = text[:300].replace("\n", " ").replace("\r", " ")
-        raise ValueError(
-            "The server did not return JSON. It returned HTML/text instead. "
-            f"Preview: {preview}"
-        )
-
-    try:
-        return response.json()
-    except json.JSONDecodeError:
-        # Some servers prepend whitespace or odd characters. Try substring extraction.
-        start_candidates = [i for i in [text.find("{"), text.find("[")] if i >= 0]
-        if start_candidates:
-            start = min(start_candidates)
-            return json.loads(text[start:])
-        raise
+def format_money(value):
+    value = safe_int(value, 0)
+    return f"{value:,}원"
 
 
-def normalize_one_record(item: dict):
-    """Normalize mirror JSON or official JSON to one row."""
-    if not isinstance(item, dict):
+def normalize_draw(raw: Dict, source: str) -> Optional[Dict]:
+    """공식 API / mirror API 데이터 형태를 앱 표준 형태로 통일"""
+    if not isinstance(raw, dict):
         return None
 
-    # Mirror format
-    if "draw_no" in item and "numbers" in item:
-        numbers = item.get("numbers") or []
-        if len(numbers) != 6:
+    # 공식 API 형태
+    if "drwNo" in raw or "drwtNo1" in raw:
+        if raw.get("returnValue") not in (None, "success"):
             return None
+        draw_no = safe_int(raw.get("drwNo"))
+        numbers = [safe_int(raw.get(f"drwtNo{i}")) for i in range(1, 7)]
+        bonus = safe_int(raw.get("bnusNo"))
+        draw_date = raw.get("drwNoDate") or raw.get("date") or ""
+        first_win = safe_int(raw.get("firstWinamnt"), 0)
+        first_count = safe_int(raw.get("firstPrzwnerCo"), 0)
+        total_sales = safe_int(raw.get("totSellamnt"), 0)
 
-        divisions = item.get("divisions") or []
-        first_prize = None
-        first_winners = None
-        if divisions and isinstance(divisions, list) and len(divisions) > 0:
-            first_prize = divisions[0].get("prize")
-            first_winners = divisions[0].get("winners")
+    # smok95 mirror 형태
+    elif "draw_no" in raw or "numbers" in raw:
+        draw_no = safe_int(raw.get("draw_no"))
+        numbers = raw.get("numbers") or []
+        numbers = [safe_int(x) for x in numbers[:6]]
+        bonus = safe_int(raw.get("bonus_no") or raw.get("bonus"))
+        draw_date = raw.get("date") or raw.get("draw_date") or ""
+        if isinstance(draw_date, str) and "T" in draw_date:
+            draw_date = draw_date.split("T")[0]
 
-        raw_date = item.get("date", "")
-        draw_date = raw_date[:10] if isinstance(raw_date, str) else ""
+        divisions = raw.get("divisions") or []
+        first_win = 0
+        first_count = 0
+        if isinstance(divisions, list) and len(divisions) > 0 and isinstance(divisions[0], dict):
+            first_win = safe_int(divisions[0].get("prize"), 0)
+            first_count = safe_int(divisions[0].get("winners"), 0)
+        total_sales = safe_int(raw.get("total_sales_amount"), 0)
 
-        return {
-            "회차": int(item.get("draw_no")),
-            "추첨일": draw_date,
-            "번호1": int(numbers[0]),
-            "번호2": int(numbers[1]),
-            "번호3": int(numbers[2]),
-            "번호4": int(numbers[3]),
-            "번호5": int(numbers[4]),
-            "번호6": int(numbers[5]),
-            "보너스": int(item.get("bonus_no")),
-            "1등당첨금": first_prize,
-            "1등당첨자수": first_winners,
-            "총판매금액": item.get("total_sales_amount"),
-            "데이터출처": "GitHub mirror",
-        }
-
-    # Official DH Lottery format
-    if item.get("returnValue") == "success" and "drwNo" in item:
-        return {
-            "회차": int(item.get("drwNo")),
-            "추첨일": item.get("drwNoDate"),
-            "번호1": int(item.get("drwtNo1")),
-            "번호2": int(item.get("drwtNo2")),
-            "번호3": int(item.get("drwtNo3")),
-            "번호4": int(item.get("drwtNo4")),
-            "번호5": int(item.get("drwtNo5")),
-            "번호6": int(item.get("drwtNo6")),
-            "보너스": int(item.get("bnusNo")),
-            "1등당첨금": item.get("firstWinamnt"),
-            "1등당첨자수": item.get("firstPrzwnerCo"),
-            "총판매금액": item.get("totSellamnt"),
-            "데이터출처": "DH Lottery official",
-        }
-
-    return None
-
-
-def normalize_all_json(data):
-    """Normalize all.json shape to a DataFrame."""
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        if "results" in data and isinstance(data["results"], list):
-            items = data["results"]
-        elif "draws" in data and isinstance(data["draws"], list):
-            items = data["draws"]
-        elif "data" in data and isinstance(data["data"], list):
-            items = data["data"]
-        else:
-            # Sometimes all.json can be a dict keyed by draw number.
-            possible_values = list(data.values())
-            if possible_values and all(isinstance(v, dict) for v in possible_values):
-                items = possible_values
-            else:
-                raise ValueError("Unknown all.json format")
     else:
-        raise ValueError("Unknown all.json format")
+        return None
+
+    if draw_no is None or len(numbers) != 6 or bonus is None:
+        return None
+
+    return {
+        "회차": draw_no,
+        "추첨일": str(draw_date)[:10],
+        "번호1": numbers[0],
+        "번호2": numbers[1],
+        "번호3": numbers[2],
+        "번호4": numbers[3],
+        "번호5": numbers[4],
+        "번호6": numbers[5],
+        "보너스": bonus,
+        "1등당첨금": first_win,
+        "1등당첨자수": first_count,
+        "총판매금액": total_sales,
+        "데이터출처": source,
+    }
+
+
+def validate_one_draw(row: Dict) -> List[str]:
+    """회차 1개 단위 기본 무결성 검사"""
+    errors = []
+    draw_no = safe_int(row.get("회차"))
+    numbers = [safe_int(row.get(f"번호{i}")) for i in range(1, 7)]
+    bonus = safe_int(row.get("보너스"))
+
+    if draw_no is None or draw_no < 1:
+        errors.append("회차 번호 오류")
+
+    if len(numbers) != 6 or any(n is None for n in numbers):
+        errors.append("당첨번호 6개 누락")
+    else:
+        if any(n < 1 or n > 45 for n in numbers):
+            errors.append("당첨번호 범위 오류")
+        if len(set(numbers)) != 6:
+            errors.append("당첨번호 중복")
+
+    if bonus is None or bonus < 1 or bonus > 45:
+        errors.append("보너스 번호 범위 오류")
+    elif bonus in numbers:
+        errors.append("보너스 번호가 당첨번호와 중복")
+
+    return errors
+
+
+def validate_history_df(df: pd.DataFrame) -> Tuple[bool, pd.DataFrame]:
+    """전체 데이터 기본 무결성 검사"""
+    issues = []
+
+    if df.empty:
+        return False, pd.DataFrame([{"구분": "전체", "내용": "데이터가 비어 있습니다."}])
+
+    needed = ["회차", "번호1", "번호2", "번호3", "번호4", "번호5", "번호6", "보너스"]
+    missing_cols = [c for c in needed if c not in df.columns]
+    if missing_cols:
+        issues.append({"구분": "컬럼", "내용": f"필수 컬럼 누락: {missing_cols}"})
+        return False, pd.DataFrame(issues)
+
+    for _, row in df.iterrows():
+        row_errors = validate_one_draw(row.to_dict())
+        for err in row_errors:
+            issues.append({"구분": f"{int(row['회차'])}회", "내용": err})
+
+    draw_nos = sorted(df["회차"].astype(int).tolist())
+    expected = list(range(min(draw_nos), max(draw_nos) + 1))
+    missing_draws = sorted(set(expected) - set(draw_nos))
+    duplicated_draws = df[df.duplicated(subset=["회차"], keep=False)]["회차"].astype(int).unique().tolist()
+
+    if missing_draws:
+        sample = missing_draws[:20]
+        more = "..." if len(missing_draws) > 20 else ""
+        issues.append({"구분": "회차 연속성", "내용": f"누락 회차: {sample}{more}"})
+
+    if duplicated_draws:
+        issues.append({"구분": "회차 중복", "내용": f"중복 회차: {sorted(duplicated_draws)}"})
+
+    if len(issues) == 0:
+        return True, pd.DataFrame([{"구분": "무결성 검사", "내용": "통과"}])
+    return False, pd.DataFrame(issues)
+
+
+# =========================================================
+# 데이터 불러오기
+# =========================================================
+def request_json(url: str, timeout: int = 15) -> Tuple[Optional[object], Optional[str]]:
+    try:
+        r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+        text = r.text.strip()
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        if text.startswith("<"):
+            return None, "JSON이 아니라 HTML이 반환되었습니다. 접속 대기/차단 페이지일 수 있습니다."
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+
+@st.cache_data(ttl=60 * 60)
+def fetch_official_draw(draw_no: int) -> Tuple[Optional[Dict], Optional[str]]:
+    raw, err = request_json(OFFICIAL_API_URL.format(draw_no=draw_no), timeout=12)
+    if err:
+        return None, err
+    normalized = normalize_draw(raw, "동행복권 공식")
+    if normalized is None:
+        return None, "공식 API 응답을 해석하지 못했습니다."
+    return normalized, None
+
+
+@st.cache_data(ttl=60 * 60)
+def fetch_mirror_latest() -> Tuple[Optional[Dict], Optional[str]]:
+    raw, err = request_json(MIRROR_LATEST_URL, timeout=15)
+    if err:
+        return None, err
+    normalized = normalize_draw(raw, "GitHub mirror")
+    if normalized is None:
+        return None, "mirror latest 응답을 해석하지 못했습니다."
+    return normalized, None
+
+
+@st.cache_data(ttl=60 * 60)
+def fetch_mirror_all() -> Tuple[pd.DataFrame, Optional[str]]:
+    raw, err = request_json(MIRROR_ALL_URL, timeout=30)
+    if err:
+        return pd.DataFrame(), err
 
     rows = []
-    for item in items:
-        row = normalize_one_record(item)
+    if isinstance(raw, list):
+        source_items = raw
+    elif isinstance(raw, dict):
+        # 혹시 dict 형태로 감싸져 있을 때 대비
+        source_items = raw.get("data") or raw.get("results") or raw.get("draws") or list(raw.values())
+    else:
+        source_items = []
+
+    for item in source_items:
+        normalized = normalize_draw(item, "GitHub mirror")
+        if normalized:
+            rows.append(normalized)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, "mirror all 데이터를 해석하지 못했습니다."
+
+    df = df.drop_duplicates(subset=["회차"], keep="last")
+    df = df.sort_values("회차", ascending=True).reset_index(drop=True)
+    return df, None
+
+
+@st.cache_data(ttl=60 * 60)
+def fetch_mirror_by_draws(latest_draw: int) -> Tuple[pd.DataFrame, Optional[str]]:
+    rows = []
+    errors = []
+    for draw_no in range(1, latest_draw + 1):
+        raw, err = request_json(MIRROR_DRAW_URL.format(draw_no=draw_no), timeout=10)
+        if err:
+            errors.append(f"{draw_no}회: {err}")
+            continue
+        normalized = normalize_draw(raw, "GitHub mirror")
+        if normalized:
+            rows.append(normalized)
+        time.sleep(0.02)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, "; ".join(errors[:5]) if errors else "회차별 mirror 데이터를 해석하지 못했습니다."
+    df = df.drop_duplicates(subset=["회차"], keep="last")
+    df = df.sort_values("회차", ascending=True).reset_index(drop=True)
+    return df, None
+
+
+@st.cache_data(ttl=60 * 60)
+def fetch_official_history_slow(latest_draw: int) -> Tuple[pd.DataFrame, Optional[str]]:
+    rows = []
+    errors = []
+    progress_every = 50
+    for draw_no in range(1, latest_draw + 1):
+        row, err = fetch_official_draw(draw_no)
         if row:
             rows.append(row)
+        else:
+            errors.append(f"{draw_no}회: {err}")
+        if draw_no % progress_every == 0:
+            time.sleep(0.2)
 
-    if not rows:
-        raise ValueError("No valid lotto rows found in JSON")
-
-    df = pd.DataFrame(rows).drop_duplicates(subset=["회차"]).sort_values("회차").reset_index(drop=True)
-    return df
-
-
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def load_from_mirror_all():
-    data = safe_request_json(MIRROR_ALL_URL, timeout=20)
-    return normalize_all_json(data)
-
-
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def load_from_mirror_loop():
-    latest = safe_request_json(MIRROR_LATEST_URL, timeout=20)
-    latest_row = normalize_one_record(latest)
-    if not latest_row:
-        raise ValueError("Could not read latest draw number from mirror")
-
-    latest_draw = int(latest_row["회차"])
-    rows = []
-    progress = st.progress(0, text="Downloading lotto history from mirror...")
-
-    for draw_no in range(1, latest_draw + 1):
-        try:
-            item = safe_request_json(MIRROR_ONE_URL.format(draw_no=draw_no), timeout=10)
-            row = normalize_one_record(item)
-            if row:
-                rows.append(row)
-        except Exception:
-            pass
-
-        if draw_no % 10 == 0 or draw_no == latest_draw:
-            progress.progress(draw_no / latest_draw, text=f"Downloading lotto history... {draw_no}/{latest_draw}")
-        time.sleep(0.01)
-
-    progress.empty()
-
-    if not rows:
-        raise ValueError("Mirror loop download failed")
-
-    return pd.DataFrame(rows).drop_duplicates(subset=["회차"]).sort_values("회차").reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, "; ".join(errors[:5]) if errors else "공식 데이터를 불러오지 못했습니다."
+    df = df.drop_duplicates(subset=["회차"], keep="last")
+    df = df.sort_values("회차", ascending=True).reset_index(drop=True)
+    return df, None
 
 
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def load_from_official_loop(max_draw: int = 1300):
-    rows = []
-    failed_streak = 0
-    progress = st.progress(0, text="Trying official DH Lottery API...")
-
-    for draw_no in range(1, max_draw + 1):
-        try:
-            item = safe_request_json(OFFICIAL_ONE_URL.format(draw_no=draw_no), timeout=10)
-            row = normalize_one_record(item)
-            if row:
-                rows.append(row)
-                failed_streak = 0
-            else:
-                failed_streak += 1
-        except Exception:
-            failed_streak += 1
-
-        if draw_no % 10 == 0:
-            progress.progress(min(draw_no / max_draw, 1.0), text=f"Trying official API... {draw_no}/{max_draw}")
-
-        # After enough valid rows, 10 consecutive missing/failed draws means likely past latest draw.
-        if len(rows) > 1000 and failed_streak >= 10:
-            break
-
-        time.sleep(0.03)
-
-    progress.empty()
-
-    if not rows:
-        raise ValueError("Official DH Lottery API failed or returned non-JSON pages")
-
-    return pd.DataFrame(rows).drop_duplicates(subset=["회차"]).sort_values("회차").reset_index(drop=True)
+def compare_draw_rows(mirror_row: Dict, official_row: Dict) -> Tuple[bool, Dict]:
+    fields = ["회차", "추첨일", "번호1", "번호2", "번호3", "번호4", "번호5", "번호6", "보너스"]
+    details = {"회차": mirror_row.get("회차")}
+    ok = True
+    for f in fields:
+        m = mirror_row.get(f)
+        o = official_row.get(f)
+        if str(m) != str(o):
+            ok = False
+        details[f"mirror_{f}"] = m
+        details[f"official_{f}"] = o
+    details["일치여부"] = "일치" if ok else "불일치"
+    return ok, details
 
 
-def save_cache(df: pd.DataFrame):
-    df.to_csv(CACHE_FILE, index=False, encoding="utf-8-sig")
+def verify_with_official(history_df: pd.DataFrame, count: int) -> Tuple[str, pd.DataFrame, List[int], Optional[str]]:
+    """최신 N개 회차를 공식 API와 비교"""
+    if history_df.empty:
+        return "검증 불가", pd.DataFrame(), [], "비교할 데이터가 없습니다."
+
+    latest_draw = int(history_df["회차"].max())
+    start_draw = max(1, latest_draw - count + 1)
+    target_draws = list(range(start_draw, latest_draw + 1))
+
+    comparison_rows = []
+    official_success = []
+    official_errors = []
+    all_ok = True
+
+    for draw_no in target_draws:
+        mirror_rows = history_df[history_df["회차"].astype(int) == draw_no]
+        if mirror_rows.empty:
+            all_ok = False
+            comparison_rows.append({"회차": draw_no, "일치여부": "mirror 데이터 없음"})
+            continue
+
+        official_row, err = fetch_official_draw(draw_no)
+        if official_row is None:
+            all_ok = False
+            official_errors.append(f"{draw_no}회: {err}")
+            comparison_rows.append({"회차": draw_no, "일치여부": "공식 조회 실패", "오류": err})
+            continue
+
+        official_success.append(draw_no)
+        ok, detail = compare_draw_rows(mirror_rows.iloc[0].to_dict(), official_row)
+        if not ok:
+            all_ok = False
+        comparison_rows.append(detail)
+        time.sleep(0.05)
+
+    compare_df = pd.DataFrame(comparison_rows)
+
+    if len(official_success) == 0:
+        return "검증 불가", compare_df, official_success, "; ".join(official_errors[:5])
+
+    if all_ok and len(official_success) == len(target_draws):
+        return "공식 검증 통과", compare_df, official_success, None
+
+    if any(str(x.get("일치여부")) == "불일치" for x in comparison_rows):
+        return "공식값과 불일치 발견", compare_df, official_success, "; ".join(official_errors[:5]) if official_errors else None
+
+    return "일부만 검증됨", compare_df, official_success, "; ".join(official_errors[:5]) if official_errors else None
 
 
-def load_cache():
-    if not CACHE_FILE.exists():
-        return None
-    df = pd.read_csv(CACHE_FILE)
-    required = {"회차", "번호1", "번호2", "번호3", "번호4", "번호5", "번호6", "보너스"}
-    if not required.issubset(set(df.columns)):
-        return None
-    return df.sort_values("회차").reset_index(drop=True)
-
-
-def load_lotto_history(force_refresh=False, source_mode="자동"):
-    errors = []
-
-    if not force_refresh:
-        cached = load_cache()
-        if cached is not None and not cached.empty:
-            return cached, "캐시 파일", errors
-
-    if source_mode in ["자동", "GitHub mirror"]:
-        try:
-            df = load_from_mirror_all()
-            save_cache(df)
-            return df, "GitHub mirror all.json", errors
-        except Exception as e:
-            errors.append(f"GitHub mirror all.json 실패: {e}")
-
-        try:
-            df = load_from_mirror_loop()
-            save_cache(df)
-            return df, "GitHub mirror per-draw", errors
-        except Exception as e:
-            errors.append(f"GitHub mirror per-draw 실패: {e}")
-
-    if source_mode in ["자동", "동행복권 공식"]:
-        try:
-            df = load_from_official_loop()
-            save_cache(df)
-            return df, "동행복권 공식 API", errors
-        except Exception as e:
-            errors.append(f"동행복권 공식 API 실패: {e}")
-
-    cached = load_cache()
-    if cached is not None and not cached.empty:
-        return cached, "캐시 파일", errors
-
-    return pd.DataFrame(), "불러오기 실패", errors
-
-
-def make_count_table(history_df: pd.DataFrame):
+# =========================================================
+# 통계 및 번호 생성
+# =========================================================
+def make_count_table(history_df: pd.DataFrame) -> pd.DataFrame:
     main_counter = Counter()
     bonus_counter = Counter()
 
     for _, row in history_df.iterrows():
-        for col in ["번호1", "번호2", "번호3", "번호4", "번호5", "번호6"]:
-            if pd.notna(row[col]):
-                main_counter[int(row[col])] += 1
-        if pd.notna(row["보너스"]):
-            bonus_counter[int(row["보너스"])] += 1
+        main_numbers = [safe_int(row[f"번호{i}"]) for i in range(1, 7)]
+        for number in main_numbers:
+            if number is not None:
+                main_counter[number] += 1
+        bonus = safe_int(row.get("보너스"))
+        if bonus is not None:
+            bonus_counter[bonus] += 1
 
     rows = []
     for number in range(1, 46):
@@ -329,29 +385,17 @@ def make_count_table(history_df: pd.DataFrame):
 
 def weighted_sample_without_replacement(numbers, weights, k=6):
     numbers = list(numbers)
-    weights = [max(float(w), 0.0) for w in weights]
+    weights = [max(1, int(w)) for w in weights]
     selected = []
 
     for _ in range(k):
-        if not numbers:
+        if len(numbers) == 0:
             break
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            chosen = random.choice(numbers)
-        else:
-            r = random.uniform(0, total_weight)
-            upto = 0
-            chosen = numbers[-1]
-            for number, weight in zip(numbers, weights):
-                upto += weight
-                if upto >= r:
-                    chosen = number
-                    break
+        chosen = random.choices(numbers, weights=weights, k=1)[0]
         idx = numbers.index(chosen)
         selected.append(chosen)
         numbers.pop(idx)
         weights.pop(idx)
-
     return sorted(selected)
 
 
@@ -372,45 +416,353 @@ def generate_lotto_numbers(count_df, mode, min_count, top_n, use_weight, set_cou
     results = []
     for _ in range(set_count):
         if use_weight:
-            results.append(weighted_sample_without_replacement(pool_numbers, pool_df["당첨횟수"].tolist(), 6))
+            nums = weighted_sample_without_replacement(pool_numbers, pool_df["당첨횟수"].tolist(), 6)
         else:
-            results.append(sorted(random.sample(pool_numbers, 6)))
+            nums = sorted(random.sample(pool_numbers, 6))
+        results.append(nums)
     return results, pool_df
 
 
-def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, source_name):
+def minmax_0_100(series: pd.Series) -> pd.Series:
+    """값을 0~100 점수로 변환"""
+    s = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
+    min_v = float(s.min())
+    max_v = float(s.max())
+    if max_v == min_v:
+        return pd.Series([50.0] * len(s), index=s.index)
+    return ((s - min_v) / (max_v - min_v) * 100).round(2)
+
+
+def extract_main_numbers(row: Dict) -> List[int]:
+    nums = []
+    for i in range(1, 7):
+        n = safe_int(row.get(f"번호{i}"))
+        if n is not None:
+            nums.append(int(n))
+    return nums
+
+
+def count_consecutive_pairs(numbers: List[int]) -> int:
+    nums = sorted(numbers)
+    return sum(1 for a, b in zip(nums, nums[1:]) if b - a == 1)
+
+
+def max_same_last_digit(numbers: List[int]) -> int:
+    counter = Counter([n % 10 for n in numbers])
+    return max(counter.values()) if counter else 0
+
+
+def combo_basic_features(numbers: List[int]) -> Dict:
+    nums = sorted([int(n) for n in numbers])
+    odd_count = sum(1 for n in nums if n % 2 == 1)
+    low_count = sum(1 for n in nums if n <= 22)
+    return {
+        "합계": sum(nums),
+        "홀수개수": odd_count,
+        "짝수개수": 6 - odd_count,
+        "저번호개수": low_count,
+        "고번호개수": 6 - low_count,
+        "연속번호쌍": count_consecutive_pairs(nums),
+        "같은끝자리최대": max_same_last_digit(nums),
+    }
+
+
+def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
+    rows = []
+    for _, row in history_df.iterrows():
+        nums = extract_main_numbers(row.to_dict())
+        if len(nums) == 6:
+            rows.append(combo_basic_features(nums))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return {
+            "sum_q10": 90, "sum_q25": 105, "sum_q75": 170, "sum_q90": 190,
+            "common_odd_counts": [2, 3, 4],
+            "common_low_counts": [2, 3, 4],
+        }
+    odd_common = df["홀수개수"].value_counts().head(3).index.astype(int).tolist()
+    low_common = df["저번호개수"].value_counts().head(3).index.astype(int).tolist()
+    return {
+        "sum_q10": float(df["합계"].quantile(0.10)),
+        "sum_q25": float(df["합계"].quantile(0.25)),
+        "sum_q75": float(df["합계"].quantile(0.75)),
+        "sum_q90": float(df["합계"].quantile(0.90)),
+        "common_odd_counts": odd_common or [2, 3, 4],
+        "common_low_counts": low_common or [2, 3, 4],
+    }
+
+
+def make_statistical_score_table(
+    history_df: pd.DataFrame,
+    count_df: pd.DataFrame,
+    recent_window: int,
+    weight_total: int,
+    weight_recent: int,
+    weight_gap: int,
+    weight_bonus: int,
+) -> pd.DataFrame:
+    """장기 빈도, 최근 흐름, 미출현 간격, 보너스 데이터를 합쳐 1~45 통계점수 생성"""
+    total_draws = max(1, len(history_df))
+    latest_draw = int(history_df["회차"].max())
+    recent_window = max(1, min(int(recent_window), total_draws))
+    recent_df = history_df.sort_values("회차", ascending=True).tail(recent_window)
+
+    recent_counter = Counter()
+    last_seen = {n: None for n in range(1, 46)}
+
+    for _, row in history_df.iterrows():
+        draw_no = int(row["회차"])
+        nums = extract_main_numbers(row.to_dict())
+        for n in nums:
+            last_seen[n] = draw_no
+
+    for _, row in recent_df.iterrows():
+        nums = extract_main_numbers(row.to_dict())
+        for n in nums:
+            recent_counter[n] += 1
+
+    base = count_df.copy().sort_values("번호").reset_index(drop=True)
+    rows = []
+    for _, row in base.iterrows():
+        n = int(row["번호"])
+        total_count = int(row["당첨횟수"])
+        bonus_count = int(row["보너스횟수"])
+        recent_count = int(recent_counter[n])
+        if last_seen[n] is None:
+            gap = latest_draw
+        else:
+            gap = latest_draw - int(last_seen[n])
+        avg_gap = total_draws / max(1, total_count)
+        gap_ratio = min(3.0, gap / max(1.0, avg_gap))
+        expected_recent = recent_window * 6 / 45
+        recent_over_expected = recent_count - expected_recent
+        rows.append({
+            "번호": n,
+            "전체당첨횟수": total_count,
+            "전체출현률": round(total_count / total_draws * 100, 2),
+            f"최근{recent_window}회출현횟수": recent_count,
+            f"최근{recent_window}회기대대비": round(recent_over_expected, 2),
+            "보너스횟수": bonus_count,
+            "마지막출현후경과회차": int(gap),
+            "평균출현간격": round(avg_gap, 2),
+            "미출현간격비율": round(gap_ratio, 2),
+        })
+
+    stats_df = pd.DataFrame(rows)
+    stats_df["장기빈도점수"] = minmax_0_100(stats_df["전체당첨횟수"])
+    stats_df["최근흐름점수"] = minmax_0_100(stats_df[f"최근{recent_window}회출현횟수"])
+    stats_df["미출현간격점수"] = minmax_0_100(stats_df["미출현간격비율"])
+    stats_df["보너스점수"] = minmax_0_100(stats_df["보너스횟수"])
+
+    total_weight = max(1, int(weight_total) + int(weight_recent) + int(weight_gap) + int(weight_bonus))
+    stats_df["통계점수"] = (
+        stats_df["장기빈도점수"] * int(weight_total)
+        + stats_df["최근흐름점수"] * int(weight_recent)
+        + stats_df["미출현간격점수"] * int(weight_gap)
+        + stats_df["보너스점수"] * int(weight_bonus)
+    ) / total_weight
+    stats_df["통계점수"] = stats_df["통계점수"].round(2)
+    return stats_df.sort_values("통계점수", ascending=False).reset_index(drop=True)
+
+
+def evaluate_statistical_combo(numbers: List[int], score_map: Dict[int, float], profile: Dict) -> Tuple[float, Dict]:
+    nums = sorted([int(n) for n in numbers])
+    features = combo_basic_features(nums)
+    number_score = sum(float(score_map.get(n, 0)) for n in nums) / 6
+
+    total_sum = features["합계"]
+    if profile["sum_q25"] <= total_sum <= profile["sum_q75"]:
+        sum_score = 100
+    elif profile["sum_q10"] <= total_sum <= profile["sum_q90"]:
+        sum_score = 82
+    else:
+        sum_score = 58
+
+    odd_score = 100 if features["홀수개수"] in profile["common_odd_counts"] else 72
+    low_score = 100 if features["저번호개수"] in profile["common_low_counts"] else 72
+
+    consecutive_pairs = features["연속번호쌍"]
+    if consecutive_pairs <= 1:
+        consecutive_score = 100
+    elif consecutive_pairs == 2:
+        consecutive_score = 80
+    else:
+        consecutive_score = 55
+
+    if features["같은끝자리최대"] <= 2:
+        end_digit_score = 100
+    elif features["같은끝자리최대"] == 3:
+        end_digit_score = 78
+    else:
+        end_digit_score = 55
+
+    combo_score = (
+        number_score * 0.70
+        + sum_score * 0.12
+        + odd_score * 0.06
+        + low_score * 0.06
+        + consecutive_score * 0.03
+        + end_digit_score * 0.03
+    )
+    details = {
+        **features,
+        "번호평균점수": round(number_score, 2),
+        "합계균형점수": round(sum_score, 2),
+        "홀짝균형점수": round(odd_score, 2),
+        "저고균형점수": round(low_score, 2),
+        "연속번호점수": round(consecutive_score, 2),
+        "끝자리분산점수": round(end_digit_score, 2),
+    }
+    return round(combo_score, 2), details
+
+
+def build_combo_reason(numbers: List[int], stats_df: pd.DataFrame, recent_window: int) -> str:
+    nums = sorted([int(n) for n in numbers])
+    score_lookup = stats_df.set_index("번호")["통계점수"].to_dict()
+    recent_col = f"최근{recent_window}회출현횟수"
+    top_nums = sorted(nums, key=lambda n: score_lookup.get(n, 0), reverse=True)[:3]
+    avg_score = sum(score_lookup.get(n, 0) for n in nums) / 6
+    recent_hits = int(stats_df[stats_df["번호"].isin(nums)][recent_col].sum()) if recent_col in stats_df.columns else 0
+    return f"통계점수 상위 번호 {top_nums} 중심, 조합 평균점수 {avg_score:.1f}, 최근 {recent_window}회 내 출현 누적 {recent_hits}회 반영"
+
+
+def generate_statistical_recommendations(
+    history_df: pd.DataFrame,
+    count_df: pd.DataFrame,
+    recent_window: int,
+    weight_total: int,
+    weight_recent: int,
+    weight_gap: int,
+    weight_bonus: int,
+    candidate_count: int,
+    recommend_count: int,
+    top_pool_size: int,
+    include_top_six: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+    stats_df = make_statistical_score_table(
+        history_df=history_df,
+        count_df=count_df,
+        recent_window=recent_window,
+        weight_total=weight_total,
+        weight_recent=weight_recent,
+        weight_gap=weight_gap,
+        weight_bonus=weight_bonus,
+    )
+    profile = make_historical_combo_profile(history_df)
+    pool_df = stats_df.head(int(top_pool_size)).copy()
+    numbers = pool_df["번호"].astype(int).tolist()
+    weights = [max(1.0, float(x)) ** 1.25 for x in pool_df["통계점수"].tolist()]
+    score_map = stats_df.set_index("번호")["통계점수"].to_dict()
+
+    candidates = {}
+    if include_top_six:
+        top_six = tuple(sorted(stats_df.head(6)["번호"].astype(int).tolist()))
+        candidates[top_six] = True
+
+    candidate_count = int(candidate_count)
+    for _ in range(candidate_count):
+        nums = tuple(weighted_sample_without_replacement(numbers, weights, 6))
+        candidates[nums] = True
+
+    rows = []
+    for combo in candidates.keys():
+        score, details = evaluate_statistical_combo(list(combo), score_map, profile)
+        nums = list(combo)
+        rows.append({
+            "추천순위": 0,
+            "번호1": nums[0],
+            "번호2": nums[1],
+            "번호3": nums[2],
+            "번호4": nums[3],
+            "번호5": nums[4],
+            "번호6": nums[5],
+            "조합통계점수": score,
+            "합계": details["합계"],
+            "홀짝": f"{details['홀수개수']}:{details['짝수개수']}",
+            "저고": f"{details['저번호개수']}:{details['고번호개수']}",
+            "연속번호쌍": details["연속번호쌍"],
+            "끝자리최대중복": details["같은끝자리최대"],
+            "추천이유": build_combo_reason(nums, stats_df, recent_window),
+        })
+
+    reco_df = pd.DataFrame(rows).sort_values("조합통계점수", ascending=False).head(int(recommend_count)).reset_index(drop=True)
+    if not reco_df.empty:
+        reco_df["추천순위"] = range(1, len(reco_df) + 1)
+    return reco_df, stats_df, profile
+
+
+def ask_nvidia_stat_ai(api_key, reco_df, stats_df, latest_draw, verification_status, recent_window):
     if not api_key or api_key == "YOUR_API_KEY":
-        return "NVIDIA API 키가 입력되지 않았습니다. 코드 상단의 NVIDIA_API_KEY 또는 왼쪽 사이드바 입력칸에 API 키를 넣어주세요."
+        return "NVIDIA API 키가 설정되지 않았습니다. Streamlit Secrets에 NVIDIA_API_KEY를 넣거나 왼쪽 입력창에 키를 입력해주세요."
+
+    client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+    reco_text = reco_df.head(5).to_string(index=False)
+    top_text = stats_df.head(15).to_string(index=False)
+
+    prompt = f"""
+아래는 로또 통계 추천 결과야.
+
+최신 반영 회차: {latest_draw}회
+데이터 검증 상태: {verification_status}
+최근 분석 회차 수: {recent_window}회
+추천 조합:
+{reco_text}
+
+번호별 통계점수 상위 일부:
+{top_text}
+
+요청:
+1. 추천 조합이 어떤 통계 기준으로 나온 것인지 짧게 설명해줘.
+2. 장기 빈도, 최근 흐름, 미출현 간격, 조합 균형을 반영했다고 설명해줘.
+3. 절대 당첨 가능성이 높다고 단정하지 말고, 로또는 독립 무작위 추첨이라 통계가 당첨을 보장하지 않는다고 말해줘.
+4. 5문장 이내로 작성해줘.
+"""
+    try:
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[
+                {"role": "system", "content": "너는 복권 통계를 신중하게 설명하는 한국어 AI 도우미다. 당첨 보장 표현은 금지한다."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.35,
+            max_tokens=700,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"NVIDIA API 호출 중 오류가 발생했습니다.\n\n오류 내용: {e}"
+
+def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, verification_status):
+    if not api_key or api_key == "YOUR_API_KEY":
+        return "NVIDIA API 키가 설정되지 않았습니다. Streamlit Secrets에 NVIDIA_API_KEY를 넣거나 왼쪽 입력창에 키를 입력해주세요."
 
     client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
     top_numbers_text = pool_df.sort_values("당첨횟수", ascending=False).head(15).to_string(index=False)
 
     prompt = f"""
-너는 로또 번호 분석 보조 AI야.
-아래 데이터는 로또 6/45 회차별 당첨번호를 바탕으로 계산한 것이다.
+아래 로또 번호 데이터와 생성 번호를 한국어로 짧게 설명해줘.
 
-데이터 출처: {source_name}
 최신 반영 회차: {latest_draw}회
+데이터 검증 상태: {verification_status}
 생성된 번호 조합: {generated_numbers}
-생성 범위의 당첨횟수 상위 번호:
+생성 범위 내 당첨횟수 상위 일부:
 {top_numbers_text}
 
-요청:
-1. 생성된 번호 조합을 짧게 설명해줘.
-2. 많이 나온 번호 위주인지, 균형적인지 말해줘.
-3. 과거 당첨횟수는 미래 당첨을 보장하지 않는다고 반드시 안내해줘.
-4. 한국어로, 과몰입하지 않게 현실적으로 작성해줘.
+필수 조건:
+1. 당첨을 보장하는 표현 금지.
+2. 로또는 매회 독립적인 무작위 추첨이라고 안내.
+3. 데이터 검증 상태가 '공식 검증 통과'가 아니면, 데이터는 공식값과 최종 확인이 필요하다고 안내.
+4. 5문장 이내.
 """
 
     try:
         response = client.chat.completions.create(
             model=NVIDIA_MODEL,
             messages=[
-                {"role": "system", "content": "너는 복권 데이터를 설명하는 한국어 AI 도우미다. 절대 당첨을 보장하지 않는다."},
+                {"role": "system", "content": "너는 복권 데이터를 신중하게 설명하는 한국어 AI 도우미다."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.6,
-            max_tokens=700,
+            temperature=0.4,
+            max_tokens=600,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -418,107 +770,245 @@ def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, source_name)
 
 
 # =========================================================
-# UI
+# 화면
 # =========================================================
-st.title("🎲 AI 로또 번호 분석/생성기")
-st.write("회차별 당첨번호 데이터를 불러와서 번호별 당첨횟수를 보고, 조건에 맞게 6개 번호를 생성합니다.")
-st.warning("주의: 로또는 무작위 추첨입니다. 과거에 많이 나온 번호가 앞으로도 더 잘 나온다는 보장은 없습니다. 이 프로그램은 재미와 데이터 확인용으로만 사용하세요.")
+st.title("🎲 통계 추천형 AI 로또 번호 분석/생성기")
+st.write("mirror 데이터를 빠르게 불러온 뒤 공식값과 비교해 신뢰도를 표시하고, 최근 결과와 통계 점수를 조합해 추천 번호를 만듭니다.")
+
+st.warning(
+    "로또는 무작위 추첨입니다. 과거 당첨횟수는 미래 당첨을 보장하지 않습니다. "
+    "이 앱은 데이터 확인과 재미용 번호 생성 도구입니다."
+)
 
 with st.sidebar:
     st.header("⚙️ 설정")
-    input_api_key = st.text_input("NVIDIA API 키", value=NVIDIA_API_KEY, type="password")
+
+    data_mode = st.radio(
+        "데이터 불러오기 방식",
+        [
+            "빠른 모드 + 공식 검증 추천",
+            "GitHub mirror만 사용",
+            "동행복권 공식 API만 사용 매우 느림",
+        ],
+        index=0,
+    )
+
+    verify_count = st.slider(
+        "공식 API와 비교할 최신 회차 수",
+        min_value=1,
+        max_value=10,
+        value=5,
+        help="숫자가 클수록 신뢰도 확인은 강해지지만, 공식 API가 막힌 환경에서는 느려질 수 있습니다.",
+    )
 
     st.divider()
-    source_mode = st.radio("데이터 불러오기 방식", ["자동", "GitHub mirror", "동행복권 공식"], index=0)
-    force_refresh = st.button("데이터 새로고침 / 캐시 다시 만들기")
+    input_api_key = st.text_input(
+        "NVIDIA API 키 선택 입력",
+        value=NVIDIA_API_KEY if NVIDIA_API_KEY != "YOUR_API_KEY" else "",
+        type="password",
+        help="Streamlit Secrets에 넣었다면 비워도 됩니다.",
+    )
+    final_api_key = input_api_key or NVIDIA_API_KEY
 
-    if st.button("캐시 파일 삭제"):
-        if CACHE_FILE.exists():
-            CACHE_FILE.unlink()
-            st.success("캐시 파일을 삭제했습니다. 새로고침 버튼을 눌러 다시 불러오세요.")
-        else:
-            st.info("삭제할 캐시 파일이 없습니다.")
+    if st.button("앱 캐시 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
 
-    st.divider()
-    st.subheader("📱 스마트폰 접속")
-    local_ip = get_local_ip()
-    st.write("PC와 스마트폰이 같은 와이파이에 연결되어 있으면 아래 주소를 스마트폰 브라우저에 입력하세요.")
-    st.code(f"http://{local_ip}:8501")
-    st.caption("접속이 안 되면 run_phone.bat으로 실행하고, 윈도우 방화벽에서 허용을 누르세요.")
+    st.caption("GitHub에 실제 API 키를 올리지 말고 Streamlit Secrets를 사용하세요.")
+
+load_error = None
+history_df = pd.DataFrame()
+source_note = ""
 
 with st.spinner("로또 데이터를 불러오는 중입니다..."):
-    history_df, source_name, load_errors = load_lotto_history(force_refresh=force_refresh, source_mode=source_mode)
+    if data_mode in ["빠른 모드 + 공식 검증 추천", "GitHub mirror만 사용"]:
+        history_df, load_error = fetch_mirror_all()
+        if history_df.empty:
+            latest_row, latest_err = fetch_mirror_latest()
+            if latest_row:
+                history_df, load_error = fetch_mirror_by_draws(int(latest_row["회차"]))
+            else:
+                load_error = load_error or latest_err
+        source_note = "GitHub mirror 기반"
+    else:
+        latest_row, latest_err = fetch_mirror_latest()
+        if latest_row:
+            history_df, load_error = fetch_official_history_slow(int(latest_row["회차"]))
+        else:
+            load_error = f"최신 회차 확인 실패: {latest_err}"
+        source_note = "동행복권 공식 API 기반"
 
 if history_df.empty:
-    st.error("로또 데이터를 불러오지 못했습니다.")
-    if load_errors:
-        st.write("오류 내용:")
-        for err in load_errors:
-            st.code(err)
+    st.error("데이터를 불러오지 못했습니다.")
+    if load_error:
+        st.code(load_error)
     st.stop()
 
-count_df = make_count_table(history_df)
+history_df = history_df.sort_values("회차", ascending=True).reset_index(drop=True)
 latest_draw = int(history_df["회차"].max())
-latest_date = history_df.loc[history_df["회차"].idxmax(), "추첨일"]
 
-st.success(f"데이터 불러오기 완료: {source_name} / 최신 반영 {latest_draw}회 ({latest_date}) / 총 {len(history_df)}개 회차")
-if load_errors:
-    with st.expander("일부 데이터 소스 실패 기록 보기"):
-        for err in load_errors:
-            st.code(err)
+integrity_ok, integrity_df = validate_history_df(history_df)
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 번호별 당첨횟수", "📅 회차별 당첨번호", "🎲 번호 생성기", "📥 다운로드"])
+verification_status = "검증 안 함"
+comparison_df = pd.DataFrame()
+verified_draws = []
+verify_error = None
+
+if data_mode == "빠른 모드 + 공식 검증 추천":
+    with st.spinner(f"최신 {verify_count}개 회차를 공식 API와 비교하는 중입니다..."):
+        verification_status, comparison_df, verified_draws, verify_error = verify_with_official(history_df, verify_count)
+elif data_mode == "동행복권 공식 API만 사용 매우 느림":
+    verification_status = "공식 API 원본 사용"
+else:
+    verification_status = "공식 검증 생략"
+
+count_df = make_count_table(history_df)
+
+# 상태 카드
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("최신 반영 회차", f"{latest_draw}회")
+with c2:
+    st.metric("총 데이터 회차", f"{len(history_df):,}개")
+with c3:
+    st.metric("데이터 출처", source_note)
+with c4:
+    st.metric("공식 검증 상태", verification_status)
+
+if integrity_ok:
+    st.success("기본 무결성 검사 통과: 번호 범위, 중복, 보너스 번호, 회차 연속성을 확인했습니다.")
+else:
+    st.error("기본 무결성 검사에서 문제가 발견되었습니다. 아래 '검증 상태' 탭을 확인하세요.")
+
+if verification_status == "공식 검증 통과":
+    st.success(f"최신 {verify_count}개 회차가 동행복권 공식 조회값과 일치했습니다.")
+elif verification_status == "공식값과 불일치 발견":
+    st.error("mirror 데이터와 동행복권 공식 조회값이 다른 회차가 있습니다. 번호 생성 전 검증 상태 탭을 확인하세요.")
+elif verification_status in ["검증 불가", "일부만 검증됨"]:
+    st.warning("공식 API 접근이 일부 실패했거나 막혀서 완전 검증은 못 했습니다. 최신 번호는 동행복권 공식 사이트에서 최종 확인하세요.")
+    if verify_error:
+        with st.expander("공식 검증 실패 사유 보기"):
+            st.code(verify_error)
+
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "✅ 검증 상태",
+    "📊 번호별 당첨횟수",
+    "📅 회차별 당첨번호",
+    "🎲 번호 생성기",
+    "📈 통계 추천 조합",
+    "📥 데이터 다운로드",
+])
 
 with tab1:
+    st.header("✅ 데이터 검증 상태")
+
+    st.subheader("1. 기본 무결성 검사")
+    st.dataframe(integrity_df, use_container_width=True, hide_index=True)
+
+    st.subheader("2. 공식 API 비교 검사")
+    if data_mode == "빠른 모드 + 공식 검증 추천":
+        st.write(f"최신 {verify_count}개 회차를 동행복권 공식 조회값과 비교했습니다.")
+        if not comparison_df.empty:
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("비교 결과가 없습니다.")
+    elif data_mode == "GitHub mirror만 사용":
+        st.info("현재는 mirror만 사용 중이라 공식 비교 검증을 생략했습니다. 왼쪽 설정에서 '빠른 모드 + 공식 검증 추천'을 선택하면 비교합니다.")
+    else:
+        st.info("공식 API만 사용 중입니다. 다만 전체 회차를 공식 API로 불러오는 방식은 매우 느릴 수 있습니다.")
+
+    st.subheader("3. 데이터 해석 기준")
+    st.write(
+        "'공식 검증 통과'는 최신 일부 회차가 공식 조회값과 일치했다는 의미입니다. "
+        "전체 회차를 100% 보증한다는 뜻은 아니지만, mirror 데이터를 무작정 사용하는 것보다 신뢰도를 높입니다."
+    )
+
+with tab2:
     st.header("📊 1~45 번호별 당첨횟수")
     col1, col2 = st.columns([1, 1])
     with col1:
         st.subheader("당첨횟수 표")
         st.dataframe(count_df, use_container_width=True, hide_index=True)
     with col2:
-        st.subheader("당첨횟수 그래프")
+        st.subheader("번호순 당첨횟수 그래프")
         chart_df = count_df.sort_values("번호").set_index("번호")[["당첨횟수"]]
         st.bar_chart(chart_df)
-
     st.subheader("🔥 당첨횟수 상위 10개 번호")
     st.dataframe(count_df.head(10), use_container_width=True, hide_index=True)
 
-with tab2:
+with tab3:
     st.header("📅 회차별 당첨번호 보기")
     col1, col2 = st.columns([1, 2])
     with col1:
-        selected_draw = st.number_input("보고 싶은 회차", min_value=1, max_value=latest_draw, value=latest_draw, step=1)
-    selected_row = history_df[history_df["회차"] == int(selected_draw)]
-    if not selected_row.empty:
-        row = selected_row.iloc[0]
-        numbers = [int(row[f"번호{i}"]) for i in range(1, 7)]
-        with col2:
+        selected_draw = st.number_input(
+            "보고 싶은 회차",
+            min_value=1,
+            max_value=latest_draw,
+            value=latest_draw,
+            step=1,
+        )
+    selected_row = history_df[history_df["회차"].astype(int) == int(selected_draw)]
+    with col2:
+        if not selected_row.empty:
+            row = selected_row.iloc[0]
+            nums = [int(row[f"번호{i}"]) for i in range(1, 7)]
             st.subheader(f"{int(selected_draw)}회 당첨번호")
             st.write(f"추첨일: {row['추첨일']}")
-            st.markdown("### " + "  ".join([f"`{n}`" for n in numbers]) + f"  + 보너스 `{int(row['보너스'])}`")
+            st.markdown("### " + "  ".join([f"`{n}`" for n in nums]) + f"  + 보너스 `{int(row['보너스'])}`")
+            if safe_int(row.get("1등당첨금"), 0) > 0:
+                st.write(f"1등 당첨금: {format_money(row.get('1등당첨금'))}")
+            if safe_int(row.get("1등당첨자수"), 0) > 0:
+                st.write(f"1등 당첨자 수: {int(row.get('1등당첨자수'))}명")
+        else:
+            st.warning("해당 회차 데이터가 없습니다.")
 
     st.divider()
     st.subheader("전체 회차 목록")
     st.dataframe(history_df.sort_values("회차", ascending=False), use_container_width=True, hide_index=True)
 
-with tab3:
+with tab4:
     st.header("🎲 조건별 로또 번호 생성기")
-    mode = st.radio("번호 생성 방식", ["전체 1~45에서 생성", "당첨횟수 N회 이상 번호에서만 생성", "당첨횟수 상위 N개 번호에서만 생성"])
+
+    if verification_status in ["공식값과 불일치 발견", "검증 불가"]:
+        st.warning("현재 데이터 검증 상태가 완전하지 않습니다. 번호 생성은 가능하지만, 데이터는 공식 사이트에서 최종 확인하세요.")
+
+    mode = st.radio(
+        "번호 생성 방식",
+        [
+            "전체 1~45에서 생성",
+            "당첨횟수 N회 이상 번호에서만 생성",
+            "당첨횟수 상위 N개 번호에서만 생성",
+        ],
+    )
 
     col1, col2, col3 = st.columns(3)
     with col1:
         default_min = int(count_df["당첨횟수"].quantile(0.75))
-        min_count = st.number_input("N회 이상 기준", min_value=0, max_value=int(count_df["당첨횟수"].max()), value=default_min, step=1)
+        min_count = st.number_input(
+            "N회 이상 기준",
+            min_value=0,
+            max_value=int(count_df["당첨횟수"].max()),
+            value=default_min,
+            step=1,
+        )
     with col2:
         top_n = st.number_input("상위 N개 기준", min_value=6, max_value=45, value=20, step=1)
     with col3:
-        set_count = st.number_input("생성할 조합 개수", min_value=1, max_value=30, value=5, step=1)
+        set_count = st.number_input("생성할 조합 개수", min_value=1, max_value=20, value=5, step=1)
 
     use_weight = st.checkbox("당첨횟수가 높은 번호가 더 잘 뽑히도록 가중치 적용", value=False)
 
     if st.button("🎲 번호 생성하기", type="primary"):
-        generated_numbers, pool_df = generate_lotto_numbers(count_df, mode, int(min_count), int(top_n), use_weight, int(set_count))
-        if not generated_numbers:
+        generated_numbers, pool_df = generate_lotto_numbers(
+            count_df=count_df,
+            mode=mode,
+            min_count=int(min_count),
+            top_n=int(top_n),
+            use_weight=use_weight,
+            set_count=int(set_count),
+        )
+        if len(generated_numbers) == 0:
             st.error("선택 가능한 번호가 6개보다 적습니다. 기준을 낮춰주세요.")
             st.dataframe(pool_df, use_container_width=True, hide_index=True)
         else:
@@ -537,15 +1027,151 @@ with tab3:
         st.dataframe(st.session_state["pool_df"].sort_values("번호"), use_container_width=True, hide_index=True)
 
         if st.button("🤖 NVIDIA AI 코멘트 생성"):
-            with st.spinner("NVIDIA AI가 설명을 만드는 중입니다..."):
-                ai_comment = ask_nvidia_ai(input_api_key, st.session_state["generated_numbers"], st.session_state["pool_df"], latest_draw, source_name)
+            with st.spinner("NVIDIA AI가 설명을 생성하는 중입니다..."):
+                ai_comment = ask_nvidia_ai(
+                    api_key=final_api_key,
+                    generated_numbers=st.session_state["generated_numbers"],
+                    pool_df=st.session_state["pool_df"],
+                    latest_draw=latest_draw,
+                    verification_status=verification_status,
+                )
             st.subheader("🤖 AI 코멘트")
             st.write(ai_comment)
 
-with tab4:
-    st.header("📥 데이터 다운로드")
-    count_csv = count_df.to_csv(index=False).encode("utf-8-sig")
-    history_csv = history_df.sort_values("회차", ascending=False).to_csv(index=False).encode("utf-8-sig")
+with tab5:
+    st.header("📈 최근 결과 + 통계 기반 추천 조합")
+    st.warning(
+        "이 기능은 '가장 당첨될 것 같은 번호'를 보장하는 기능이 아닙니다. "
+        "장기 빈도, 최근 흐름, 미출현 간격, 보너스 출현, 조합 균형을 점수화해 참고용 조합을 추천합니다. "
+        "로또는 매회 독립적인 무작위 추첨입니다."
+    )
 
-    st.download_button("번호별 당첨횟수 CSV 다운로드", data=count_csv, file_name="lotto_number_count.csv", mime="text/csv")
-    st.download_button("회차별 당첨번호 CSV 다운로드", data=history_csv, file_name="lotto_history.csv", mime="text/csv")
+    if verification_status in ["공식값과 불일치 발견", "검증 불가"]:
+        st.warning("현재 데이터 검증 상태가 완전하지 않습니다. 추천 조합 생성 전 최신 회차는 동행복권 공식 사이트에서 최종 확인하세요.")
+
+    st.subheader("분석 기준 설정")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        recent_window = st.slider(
+            "최근 흐름을 볼 회차 수",
+            min_value=10,
+            max_value=min(200, len(history_df)),
+            value=min(50, len(history_df)),
+            step=10,
+            help="최근 N회 안에서 많이 나온 번호를 최근 흐름 점수에 반영합니다.",
+        )
+    with c2:
+        top_pool_size = st.slider(
+            "추천 후보 번호 범위",
+            min_value=10,
+            max_value=45,
+            value=30,
+            step=1,
+            help="통계점수 상위 몇 개 번호 안에서 조합 후보를 만들지 정합니다.",
+        )
+    with c3:
+        recommend_count = st.number_input("추천 조합 개수", min_value=1, max_value=20, value=5, step=1)
+
+    st.subheader("통계 가중치")
+    w1, w2, w3, w4 = st.columns(4)
+    with w1:
+        weight_total = st.slider("장기 빈도", 0, 100, 35)
+    with w2:
+        weight_recent = st.slider("최근 흐름", 0, 100, 30)
+    with w3:
+        weight_gap = st.slider("미출현 간격", 0, 100, 25)
+    with w4:
+        weight_bonus = st.slider("보너스 출현", 0, 100, 10)
+
+    c4, c5 = st.columns(2)
+    with c4:
+        candidate_count = st.slider(
+            "검토할 후보 조합 수",
+            min_value=1000,
+            max_value=20000,
+            value=5000,
+            step=1000,
+            help="숫자가 클수록 더 많은 조합을 비교하지만 실행 시간이 조금 늘어납니다.",
+        )
+    with c5:
+        include_top_six = st.checkbox("통계점수 상위 6개 조합도 후보에 포함", value=True)
+
+    with st.expander("이 기능이 점수에 반영하는 정보"):
+        st.write(
+            "1. 장기 빈도: 전체 회차에서 많이 나온 번호인지 봅니다.\n\n"
+            "2. 최근 흐름: 최근 N회 안에서 상대적으로 자주 나온 번호인지 봅니다.\n\n"
+            "3. 미출현 간격: 평균 출현 간격 대비 최근에 얼마나 오래 안 나왔는지 봅니다.\n\n"
+            "4. 보너스 출현: 보너스 번호로 자주 나온 정도를 약하게 반영합니다.\n\n"
+            "5. 조합 균형: 과거 조합의 합계 범위, 홀짝 비율, 저번호/고번호 비율, 연속번호 과다 여부, 끝자리 쏠림을 함께 봅니다."
+        )
+
+    if st.button("📈 통계 추천 조합 만들기", type="primary"):
+        with st.spinner("여러 후보 조합을 만들고 통계 점수로 정렬하는 중입니다..."):
+            reco_df, stat_score_df, combo_profile = generate_statistical_recommendations(
+                history_df=history_df,
+                count_df=count_df,
+                recent_window=int(recent_window),
+                weight_total=int(weight_total),
+                weight_recent=int(weight_recent),
+                weight_gap=int(weight_gap),
+                weight_bonus=int(weight_bonus),
+                candidate_count=int(candidate_count),
+                recommend_count=int(recommend_count),
+                top_pool_size=int(top_pool_size),
+                include_top_six=bool(include_top_six),
+            )
+            st.session_state["reco_df"] = reco_df
+            st.session_state["stat_score_df"] = stat_score_df
+            st.session_state["stat_recent_window"] = int(recent_window)
+            st.session_state["combo_profile"] = combo_profile
+
+    if "reco_df" in st.session_state:
+        st.subheader("추천 조합")
+        st.dataframe(st.session_state["reco_df"], use_container_width=True, hide_index=True)
+
+        st.subheader("번호별 통계점수 상위 15개")
+        st.dataframe(st.session_state["stat_score_df"].head(15), use_container_width=True, hide_index=True)
+
+        with st.expander("추천 조합 기준값 보기"):
+            profile = st.session_state.get("combo_profile", {})
+            st.write(
+                f"과거 조합 합계의 주요 범위: 약 {profile.get('sum_q25', 0):.0f} ~ {profile.get('sum_q75', 0):.0f}점, "
+                f"넓은 범위: 약 {profile.get('sum_q10', 0):.0f} ~ {profile.get('sum_q90', 0):.0f}점"
+            )
+            st.write(f"자주 나타난 홀수 개수 패턴: {profile.get('common_odd_counts', [])}")
+            st.write(f"자주 나타난 저번호 개수 패턴: {profile.get('common_low_counts', [])}")
+
+        if st.button("🤖 통계 추천 AI 설명 생성"):
+            with st.spinner("NVIDIA AI가 통계 추천 결과를 설명하는 중입니다..."):
+                ai_comment = ask_nvidia_stat_ai(
+                    api_key=final_api_key,
+                    reco_df=st.session_state["reco_df"],
+                    stats_df=st.session_state["stat_score_df"],
+                    latest_draw=latest_draw,
+                    verification_status=verification_status,
+                    recent_window=st.session_state["stat_recent_window"],
+                )
+            st.subheader("🤖 AI 설명")
+            st.write(ai_comment)
+
+with tab6:
+    st.header("📥 데이터 다운로드")
+    st.download_button(
+        label="번호별 당첨횟수 CSV 다운로드",
+        data=count_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="lotto_number_count_verified.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        label="회차별 당첨번호 CSV 다운로드",
+        data=history_df.sort_values("회차", ascending=False).to_csv(index=False).encode("utf-8-sig"),
+        file_name="lotto_history_verified.csv",
+        mime="text/csv",
+    )
+    if not comparison_df.empty:
+        st.download_button(
+            label="공식 검증 비교결과 CSV 다운로드",
+            data=comparison_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="lotto_official_verification.csv",
+            mime="text/csv",
+        )
