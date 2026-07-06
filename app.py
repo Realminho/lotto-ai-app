@@ -38,7 +38,7 @@ REQUEST_HEADERS = {
 }
 
 st.set_page_config(
-    page_title="극단 패턴 보존형 AI 로또 번호 분석/생성기 v9",
+    page_title="직전번호 재등장 패턴 강화형 AI 로또 번호 분석/생성기 v10",
     page_icon="🎲",
     layout="wide",
 )
@@ -445,6 +445,11 @@ def extract_main_numbers(row: Dict) -> List[int]:
     return nums
 
 
+def extract_bonus_number(row: Dict) -> Optional[int]:
+    n = safe_int(row.get("보너스"))
+    return int(n) if n is not None else None
+
+
 def count_consecutive_pairs(numbers: List[int]) -> int:
     nums = sorted(numbers)
     return sum(1 for a, b in zip(nums, nums[1:]) if b - a == 1)
@@ -659,6 +664,130 @@ def combo_pattern_values_from_features(features: Dict) -> Dict[str, str]:
     }
 
 
+def make_reappearance_pattern_values(
+    numbers: List[int],
+    previous_main_draws: List[List[int]],
+    previous_bonuses: List[Optional[int]],
+    current_bonus: Optional[int] = None,
+    include_current_bonus_patterns: bool = False,
+) -> Dict[str, str]:
+    """이전 회차 본번호/보너스가 이번 본번호 또는 보너스로 다시 등장하는 패턴을 만든다."""
+    nums_set = set(int(n) for n in numbers)
+    main_draws = [set(int(x) for x in draw) for draw in (previous_main_draws or []) if draw]
+    bonuses = [int(b) for b in (previous_bonuses or []) if b is not None]
+    values: Dict[str, str] = {}
+
+    if not main_draws:
+        return values
+
+    prev_main = main_draws[-1]
+    prev_bonus = bonuses[-1] if bonuses else None
+    prev_bonus_set = {prev_bonus} if prev_bonus is not None else set()
+    prev_all = set(prev_main) | prev_bonus_set
+
+    prev_main_hit = len(nums_set & prev_main)
+    prev_bonus_hit = 1 if prev_bonus is not None and prev_bonus in nums_set else 0
+    prev_all_hit = len(nums_set & prev_all)
+
+    values["직전 본번호→본번호 재등장 개수"] = f"{prev_main_hit}개"
+    values["직전 보너스→본번호 재등장 여부"] = "재등장" if prev_bonus_hit else "미등장"
+    values["직전 전체7개→본번호 재등장 개수"] = f"{prev_all_hit}개"
+    values["직전 본번호/보너스→본번호 조합"] = f"본{prev_main_hit}개+보너스{prev_bonus_hit}개"
+
+    if include_current_bonus_patterns and current_bonus is not None:
+        cb = int(current_bonus)
+        values["직전 본번호→이번 보너스 재등장 여부"] = "재등장" if cb in prev_main else "미등장"
+        values["직전 보너스→이번 보너스 재등장 여부"] = "재등장" if prev_bonus is not None and cb == prev_bonus else "미등장"
+        values["직전 전체7개→이번 보너스 재등장 여부"] = "재등장" if cb in prev_all else "미등장"
+
+    for window in [2, 3, 5, 10]:
+        recent_main = set(x for draw in main_draws[-window:] for x in draw)
+        recent_bonus = set(bonuses[-window:]) if bonuses else set()
+        recent_all = recent_main | recent_bonus
+
+        main_hit = len(nums_set & recent_main)
+        bonus_hit = len(nums_set & recent_bonus)
+        all_hit = len(nums_set & recent_all)
+
+        values[f"직전 {window}회 본번호범위→본번호 재등장 개수"] = f"{main_hit}개"
+        values[f"직전 {window}회 보너스범위→본번호 재등장 개수"] = f"{bonus_hit}개"
+        values[f"직전 {window}회 전체7개범위→본번호 재등장 개수"] = f"{all_hit}개"
+        values[f"직전 {window}회 본/보너스→본번호 조합"] = f"본{main_hit}개+보너스{bonus_hit}개+전체{all_hit}개"
+
+        if include_current_bonus_patterns and current_bonus is not None:
+            cb = int(current_bonus)
+            values[f"직전 {window}회 본번호범위→이번 보너스 재등장 여부"] = "재등장" if cb in recent_main else "미등장"
+            values[f"직전 {window}회 보너스범위→이번 보너스 재등장 여부"] = "재등장" if cb in recent_bonus else "미등장"
+            values[f"직전 {window}회 전체7개범위→이번 보너스 재등장 여부"] = "재등장" if cb in recent_all else "미등장"
+
+    return values
+
+
+def make_candidate_reappearance_pattern_values(numbers: List[int], profile: Dict) -> Dict[str, str]:
+    """추천 후보 조합이 최신/최근 번호를 얼마나 다시 포함하는지 패턴값으로 변환한다."""
+    if not isinstance(profile, dict):
+        return {}
+    return make_reappearance_pattern_values(
+        numbers=numbers,
+        previous_main_draws=profile.get("recent_main_draws", []),
+        previous_bonuses=profile.get("recent_bonus_numbers", []),
+        current_bonus=None,
+        include_current_bonus_patterns=False,
+    )
+
+
+def candidate_reappearance_numeric_details(numbers: List[int], profile: Dict) -> Dict[str, object]:
+    """추천 조합 표시용 직전/최근 재등장 수치."""
+    nums_set = set(int(n) for n in numbers)
+    main_draws = [set(int(x) for x in draw) for draw in (profile.get("recent_main_draws", []) if isinstance(profile, dict) else []) if draw]
+    bonuses = [int(b) for b in (profile.get("recent_bonus_numbers", []) if isinstance(profile, dict) else []) if b is not None]
+    out = {
+        "직전본번호재등장개수": 0,
+        "직전보너스본번호재등장여부": "미등장",
+        "직전전체7개재등장개수": 0,
+        "최근2회본번호재등장개수": 0,
+        "최근2회보너스본번호재등장개수": 0,
+        "최근2회전체7개재등장개수": 0,
+        "최근3회본번호재등장개수": 0,
+        "최근3회보너스본번호재등장개수": 0,
+        "최근3회전체7개재등장개수": 0,
+        "최근5회본번호재등장개수": 0,
+        "최근5회보너스본번호재등장개수": 0,
+        "최근5회전체7개재등장개수": 0,
+        "최근10회본번호재등장개수": 0,
+        "최근10회보너스본번호재등장개수": 0,
+        "최근10회전체7개재등장개수": 0,
+    }
+    if not main_draws:
+        return out
+
+    latest_main = main_draws[-1]
+    latest_bonus = bonuses[-1] if bonuses else None
+    latest_all = set(latest_main) | ({latest_bonus} if latest_bonus is not None else set())
+    out["직전본번호재등장개수"] = len(nums_set & latest_main)
+    out["직전보너스본번호재등장여부"] = "재등장" if latest_bonus is not None and latest_bonus in nums_set else "미등장"
+    out["직전전체7개재등장개수"] = len(nums_set & latest_all)
+
+    for window in [2, 3, 5, 10]:
+        recent_main = set(x for draw in main_draws[-window:] for x in draw)
+        recent_bonus = set(bonuses[-window:]) if bonuses else set()
+        recent_all = recent_main | recent_bonus
+        out[f"최근{window}회본번호재등장개수"] = len(nums_set & recent_main)
+        out[f"최근{window}회보너스본번호재등장개수"] = len(nums_set & recent_bonus)
+        out[f"최근{window}회전체7개재등장개수"] = len(nums_set & recent_all)
+    return out
+
+
+def candidate_reappearance_text(numbers: List[int], profile: Dict) -> str:
+    d = candidate_reappearance_numeric_details(numbers, profile)
+    return (
+        f"직전 본번호 {d.get('직전본번호재등장개수', 0)}개 재등장, "
+        f"직전 보너스→본번호 {d.get('직전보너스본번호재등장여부', '미등장')}, "
+        f"직전 전체7개 {d.get('직전전체7개재등장개수', 0)}개 재등장, "
+        f"최근5회 본번호 {d.get('최근5회본번호재등장개수', 0)}개/보너스 {d.get('최근5회보너스본번호재등장개수', 0)}개 포함"
+    )
+
+
 def summarize_combo_patterns(features: Dict) -> str:
     return (
         f"홀{features['홀수개수']}/짝{features['짝수개수']}, "
@@ -682,6 +811,7 @@ def make_pattern_analysis(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     """
     rows = []
     prev_draws = []
+    prev_bonuses = []
     for _, row in history_df.sort_values("회차", ascending=True).iterrows():
         nums = extract_main_numbers(row.to_dict())
         if len(nums) != 6:
@@ -689,17 +819,15 @@ def make_pattern_analysis(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         features = combo_basic_features(nums)
         pattern_values = combo_pattern_values_from_features(features)
 
-        if prev_draws:
-            prev1 = set(prev_draws[-1])
-            pattern_values["직전 1회 재등장 개수"] = f"{len(set(nums) & prev1)}개"
-            prev5 = set(x for draw in prev_draws[-5:] for x in draw)
-            prev10 = set(x for draw in prev_draws[-10:] for x in draw)
-            pattern_values["직전 5회 범위 재등장 개수"] = f"{len(set(nums) & prev5)}개"
-            pattern_values["직전 10회 범위 재등장 개수"] = f"{len(set(nums) & prev10)}개"
-        else:
-            pattern_values["직전 1회 재등장 개수"] = "이전회차 없음"
-            pattern_values["직전 5회 범위 재등장 개수"] = "이전회차 없음"
-            pattern_values["직전 10회 범위 재등장 개수"] = "이전회차 없음"
+        bonus = extract_bonus_number(row.to_dict())
+        # v10: 직전 본번호/보너스가 이번 본번호 또는 보너스로 다시 등장하는 세부 패턴을 모두 추가한다.
+        pattern_values.update(make_reappearance_pattern_values(
+            numbers=nums,
+            previous_main_draws=prev_draws,
+            previous_bonuses=prev_bonuses,
+            current_bonus=bonus,
+            include_current_bonus_patterns=True,
+        ))
 
         for ptype, pvalue in pattern_values.items():
             rows.append({
@@ -709,6 +837,7 @@ def make_pattern_analysis(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
                 "패턴값": str(pvalue),
             })
         prev_draws.append(nums)
+        prev_bonuses.append(bonus)
 
     raw_df = pd.DataFrame(rows)
     if raw_df.empty:
@@ -762,8 +891,9 @@ def score_pattern_value(pattern_maps: Dict[str, Dict[str, int]], ptype: str, pva
 def calculate_pattern_score(features: Dict, profile: Dict) -> Tuple[float, Dict[str, float]]:
     pattern_maps = profile.get("pattern_maps", {}) if isinstance(profile, dict) else {}
     pattern_values = combo_pattern_values_from_features(features)
-    # v9: 균형 패턴만 고르지 않고 실제 추출 가능한 모든 패턴을 점수에 넣는다.
-    # 너무 세부적인 패턴도 낮은 비중이 아니라 동일하게 참고하되, 바닥점이 높아 극단값이 배제되지 않는다.
+    pattern_values.update(make_candidate_reappearance_pattern_values(features.get("번호목록", []), profile))
+    # v10: 기본 조합 패턴 + 직전 본번호/보너스 재등장 패턴을 함께 점수화한다.
+    # 직전 번호가 또 나오는 경우도 배제하지 않고, 과거에 실제로 몇 개 재등장했는지의 빈도 기반으로 판단한다.
     scores = {}
     for ptype, pvalue in pattern_values.items():
         scores[ptype] = score_pattern_value(pattern_maps, ptype, str(pvalue))
@@ -788,6 +918,7 @@ def pattern_support_summary(numbers: List[int], profile: Dict, top_n: int = 10) 
     try:
         features = combo_basic_features(numbers)
         pattern_values = combo_pattern_values_from_features(features)
+        pattern_values.update(make_candidate_reappearance_pattern_values(numbers, profile))
         pattern_maps = profile.get("pattern_maps", {})
         pattern_totals = profile.get("pattern_totals", {})
         rows = []
@@ -797,7 +928,7 @@ def pattern_support_summary(numbers: List[int], profile: Dict, top_n: int = 10) 
             pct = round(count / total * 100, 2) if total else 0.0
             rows.append((ptype, str(pvalue), count, pct))
         # 빈도 높은 패턴 일부 + 극단/쏠림 관련 패턴은 우선 표시
-        priority_words = ["극단", "쏠림", "홀짝 개수", "저번호/고번호", "5구간", "십대", "합계", "범위폭"]
+        priority_words = ["재등장", "직전", "보너스", "극단", "쏠림", "홀짝 개수", "저번호/고번호", "5구간", "십대", "합계", "범위폭"]
         rows.sort(key=lambda x: (not any(w in x[0] for w in priority_words), -x[2], x[0]))
         return " / ".join([f"{ptype}={pvalue}({count}회,{pct}%)" for ptype, pvalue, count, pct in rows[:int(top_n)]])
     except Exception:
@@ -828,6 +959,7 @@ def combo_basic_features(numbers: List[int]) -> Dict:
     end_digit_counts = Counter(last_digits)
 
     base = {
+        "번호목록": nums,
         "합계": total_sum,
         "평균값": round(avg_value, 2),
         "중앙값": round(median_value, 2),
@@ -897,13 +1029,23 @@ def combo_basic_features(numbers: List[int]) -> Dict:
 
 def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
     rows = []
-    for _, row in history_df.iterrows():
-        nums = extract_main_numbers(row.to_dict())
+    ordered_df = history_df.sort_values("회차", ascending=True).reset_index(drop=True)
+    recent_main_draws = []
+    recent_bonus_numbers = []
+    for _, row in ordered_df.iterrows():
+        row_dict = row.to_dict()
+        nums = extract_main_numbers(row_dict)
+        bonus = extract_bonus_number(row_dict)
         if len(nums) == 6:
             one = combo_basic_features(nums)
             one["회차"] = int(row["회차"])
             one["당첨번호"] = "-".join(map(str, sorted(nums)))
+            one["보너스"] = bonus
             rows.append(one)
+            recent_main_draws.append(sorted(nums))
+            recent_bonus_numbers.append(bonus)
+    latest_main_numbers = recent_main_draws[-1] if recent_main_draws else []
+    latest_bonus_number = recent_bonus_numbers[-1] if recent_bonus_numbers else None
     df = pd.DataFrame(rows)
     pattern_summary_df, _ = make_pattern_analysis(history_df)
     pattern_maps = make_pattern_maps(pattern_summary_df)
@@ -920,6 +1062,10 @@ def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
             "pattern_totals": pattern_totals,
             "pattern_top_text": pattern_top_text,
             "historical_feature_rows": [],
+            "recent_main_draws": recent_main_draws,
+            "recent_bonus_numbers": recent_bonus_numbers,
+            "latest_main_numbers": latest_main_numbers,
+            "latest_bonus_number": latest_bonus_number,
         }
     odd_common = df["홀수개수"].value_counts().index.astype(int).tolist()
     low_common = df["저번호개수"].value_counts().index.astype(int).tolist()
@@ -936,6 +1082,10 @@ def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
         "pattern_totals": pattern_totals,
         "pattern_top_text": pattern_top_text,
         "historical_feature_rows": df.to_dict("records"),
+        "recent_main_draws": recent_main_draws,
+        "recent_bonus_numbers": recent_bonus_numbers,
+        "latest_main_numbers": latest_main_numbers,
+        "latest_bonus_number": latest_bonus_number,
     }
 
 
@@ -1015,6 +1165,7 @@ def make_statistical_score_table(
 def evaluate_statistical_combo(numbers: List[int], score_map: Dict[int, float], profile: Dict) -> Tuple[float, Dict]:
     nums = sorted([int(n) for n in numbers])
     features = combo_basic_features(nums)
+    reappearance_details = candidate_reappearance_numeric_details(nums, profile)
     number_score = sum(float(score_map.get(n, 0)) for n in nums) / 6
 
     pattern_score, pattern_detail_scores = calculate_pattern_score(features, profile)
@@ -1043,6 +1194,8 @@ def evaluate_statistical_combo(numbers: List[int], score_map: Dict[int, float], 
         "쏠림패턴점수": round(concentration_score, 2),
         "패턴상세점수": pattern_detail_scores,
         "패턴요약": summarize_combo_patterns(features),
+        "재등장요약": candidate_reappearance_text(nums, profile),
+        **reappearance_details,
         "홀짝균형점수": round(odd_score, 2),
         "저고균형점수": round(low_score, 2),
         "연속번호점수": round(consecutive_score, 2),
@@ -1060,9 +1213,11 @@ def build_combo_reason(numbers: List[int], stats_df: pd.DataFrame, recent_window
     recent_hits = int(stats_df[stats_df["번호"].isin(nums)][recent_col].sum()) if recent_col in stats_df.columns else 0
     features = combo_basic_features(nums)
     support = pattern_support_summary(nums, profile or {}, top_n=5) if profile else ""
+    reappear_text = candidate_reappearance_text(nums, profile or {}) if profile else ""
     return (
         f"통계점수 상위 번호 {top_nums} 중심, 조합 평균점수 {avg_score:.1f}, "
         f"최근 {recent_window}회 내 출현 누적 {recent_hits}회, "
+        f"재등장패턴: {reappear_text}, "
         f"패턴: {summarize_combo_patterns(features)}"
         + (f" / 과거빈도: {support}" if support else "")
     )
@@ -1135,6 +1290,8 @@ def pattern_family_key_from_row(row: Dict) -> str:
         str(row.get("연속번호쌍", "")),
         str(row.get("끝자리최대중복", "")),
         str(row.get("쏠림종합유형", "")),
+        str(row.get("직전전체7개재등장", "")),
+        str(row.get("최근5회전체7개재등장", "")),
     ])
 
 
@@ -1234,7 +1391,36 @@ def generate_statistical_recommendations(
                 nums = sample_weighted_numbers_from_pool(unique_pool, score_map)
                 candidates[nums] = label
 
-    # 5) 부족하면 보충
+    # 5) 직전 회차 본번호/보너스가 다음 회차에 다시 나오는 패턴도 강제로 후보에 포함.
+    latest_pool = sorted(set(profile.get("latest_main_numbers", [])) | ({profile.get("latest_bonus_number")} if profile.get("latest_bonus_number") is not None else set()))
+    recent5_pool = sorted(set(x for draw in profile.get("recent_main_draws", [])[-5:] for x in draw) | set(b for b in profile.get("recent_bonus_numbers", [])[-5:] if b is not None))
+
+    def add_forced_reappearance_candidates(label: str, forced_pool: List[int], k_values: List[int], repeats: int):
+        forced_pool_clean = sorted(set(int(x) for x in forced_pool if x is not None and 1 <= int(x) <= 45))
+        if not forced_pool_clean:
+            return
+        for k in k_values:
+            k = min(int(k), len(forced_pool_clean), 6)
+            if k <= 0:
+                continue
+            for _ in range(int(repeats)):
+                forced = random.sample(forced_pool_clean, k)
+                rest_pool = [n for n in all_numbers if n not in forced]
+                rest = list(sample_weighted_numbers_from_pool(rest_pool, score_map, 6 - k)) if 6 - k > 0 else []
+                nums = tuple(sorted(forced + rest))
+                candidates[nums] = f"{label} {k}개 포함 후보"
+
+    add_forced_reappearance_candidates("직전 전체7개 재등장", latest_pool, [1, 2, 3, 4], max(8, candidate_count // 80))
+    if profile.get("latest_bonus_number") is not None:
+        bonus = int(profile.get("latest_bonus_number"))
+        for _ in range(max(6, candidate_count // 100)):
+            rest_pool = [n for n in all_numbers if n != bonus]
+            rest = list(sample_weighted_numbers_from_pool(rest_pool, score_map, 5))
+            nums = tuple(sorted([bonus] + rest))
+            candidates[nums] = "직전 보너스 본번호 재등장 후보"
+    add_forced_reappearance_candidates("최근5회 전체7개 재등장", recent5_pool, [2, 3, 4, 5], max(8, candidate_count // 90))
+
+    # 6) 부족하면 보충
     safety = 0
     while len(candidates) < max(candidate_count, recommend_count * 20) and safety < candidate_count * 2:
         nums = sample_weighted_numbers_from_pool(all_numbers, score_map)
@@ -1276,6 +1462,14 @@ def generate_statistical_recommendations(
             "쏠림패턴점수": details["쏠림패턴점수"],
             "패턴요약": details["패턴요약"],
             "주요패턴빈도": pattern_support_summary(nums, profile, top_n=8),
+            "재등장요약": details.get("재등장요약", ""),
+            "직전본번호재등장": details.get("직전본번호재등장개수", 0),
+            "직전보너스본번호재등장": details.get("직전보너스본번호재등장여부", "미등장"),
+            "직전전체7개재등장": details.get("직전전체7개재등장개수", 0),
+            "최근5회본번호재등장": details.get("최근5회본번호재등장개수", 0),
+            "최근5회보너스본번호재등장": details.get("최근5회보너스본번호재등장개수", 0),
+            "최근5회전체7개재등장": details.get("최근5회전체7개재등장개수", 0),
+            "최근10회전체7개재등장": details.get("최근10회전체7개재등장개수", 0),
             "추천이유": build_combo_reason(nums, stats_df, recent_window, profile),
         })
 
@@ -1335,6 +1529,14 @@ def make_combo_numeric_detail_df(reco_df: pd.DataFrame, stats_df: pd.DataFrame, 
             "패턴종합점수": row.get("패턴종합점수", ""),
             "쏠림패턴점수": row.get("쏠림패턴점수", ""),
             "주요패턴빈도": row.get("주요패턴빈도", ""),
+            "재등장요약": row.get("재등장요약", ""),
+            "직전본번호재등장": row.get("직전본번호재등장", ""),
+            "직전보너스본번호재등장": row.get("직전보너스본번호재등장", ""),
+            "직전전체7개재등장": row.get("직전전체7개재등장", ""),
+            "최근5회본번호재등장": row.get("최근5회본번호재등장", ""),
+            "최근5회보너스본번호재등장": row.get("최근5회보너스본번호재등장", ""),
+            "최근5회전체7개재등장": row.get("최근5회전체7개재등장", ""),
+            "최근10회전체7개재등장": row.get("최근10회전체7개재등장", ""),
             "패턴요약": row.get("패턴요약", ""),
             "연속번호쌍": row.get("연속번호쌍", 0),
             "끝자리최대중복": row.get("끝자리최대중복", 0),
@@ -1448,6 +1650,7 @@ def ask_nvidia_stat_ai(api_key, reco_df, stats_df, latest_draw, verification_sta
    - 전체당첨횟수합
    - 최근 {recent_window}회 출현합
    - 합계, 홀짝, 저고, 구간분포5, 소수개수, 3배수개수, 5배수개수, 연속번호쌍, 패턴종합점수
+   - 직전본번호재등장, 직전보너스본번호재등장, 직전전체7개재등장, 최근5회본번호재등장, 최근5회보너스본번호재등장
 3. 마지막에는 '주의' 문단을 넣고 로또는 독립 무작위 추첨이라 이 분석이 당첨을 보장하지 않는다고 명확히 말해.
 4. 숫자는 표에 있는 값을 그대로 사용하고, 없는 값은 추측하지 마.
 """
@@ -1573,6 +1776,14 @@ def ai_items_to_reco_df(items: List[Dict], stats_df: pd.DataFrame, profile: Dict
             "쏠림패턴점수": details["쏠림패턴점수"],
             "패턴요약": details["패턴요약"],
             "주요패턴빈도": pattern_support_summary(nums, profile, top_n=8),
+            "재등장요약": details.get("재등장요약", ""),
+            "직전본번호재등장": details.get("직전본번호재등장개수", 0),
+            "직전보너스본번호재등장": details.get("직전보너스본번호재등장여부", "미등장"),
+            "직전전체7개재등장": details.get("직전전체7개재등장개수", 0),
+            "최근5회본번호재등장": details.get("최근5회본번호재등장개수", 0),
+            "최근5회보너스본번호재등장": details.get("최근5회보너스본번호재등장개수", 0),
+            "최근5회전체7개재등장": details.get("최근5회전체7개재등장개수", 0),
+            "최근10회전체7개재등장": details.get("최근10회전체7개재등장개수", 0),
             "AI전략": item.get("strategy", "AI 통계 조합"),
             "AI추천이유": item.get("reason", ""),
             "수치추천이유": numeric_reason,
@@ -1630,6 +1841,7 @@ def ask_nvidia_make_recommendations(
 - 패턴은 홀짝/저고 2가지만 보지 말고, 아래 패턴 빈도표 전체를 참고
 - 전부 홀수, 전부 짝수, 전부 저번호, 전부 고번호, 특정 구간 쏠림도 실제 과거 등장 빈도에 따라 판단하고 절대 사전 배제하지 않는다
 - 5구간/3구간/십대분포, 합계, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 배수, 나머지, 간격, 쏠림종합유형까지 함께 고려한다
+- 직전 회차 본번호가 다시 나오는 경우, 직전 보너스 번호가 다음 본번호로 나오는 경우, 최근 5~10회 본번호/보너스가 다시 나오는 경우도 실제 빈도 패턴으로 고려하고 배제하지 않는다
 - 단, 가장 흔한 패턴만 복사하지 말고 조합끼리는 서로 다르게 분산
 
 [기본 정보]
@@ -1718,8 +1930,8 @@ def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, verification
 # =========================================================
 # 화면
 # =========================================================
-st.title("🎲 극단 패턴 보존형 AI 로또 번호 분석/생성기 v9")
-st.write("mirror 데이터를 빠르게 불러오고 내부 무결성 검사를 기본 적용합니다. 공식 API 검증은 동행복권 사이트가 클라우드 접속을 차단할 수 있어 선택 기능으로 제공합니다.")
+st.title("🎲 직전번호 재등장 패턴 강화형 AI 로또 번호 분석/생성기 v10")
+st.write("mirror 데이터를 빠르게 불러오고 내부 무결성 검사를 기본 적용합니다. v10은 직전 본번호/보너스 번호가 다음 회차에 다시 등장하는 패턴까지 세분화해 반영합니다.")
 
 st.warning(
     "로또는 무작위 추첨입니다. 과거 당첨횟수는 미래 당첨을 보장하지 않습니다. "
@@ -2002,7 +2214,7 @@ with tab5:
     st.header("🧩 과거 당첨 조합 패턴 분석")
     st.write(
         "홀짝/저고만 보는 것이 아니라, 전부 홀수·전부 짝수·전부 저번호·전부 고번호 같은 극단 패턴, "
-        "구간 쏠림, 합계구간, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 배수, 나머지, 간격, 직전 회차 재등장 수까지 뽑아 빈도순으로 보여줍니다."
+        "구간 쏠림, 합계구간, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 배수, 나머지, 간격, 직전 본번호/보너스 재등장, 최근 2·3·5·10회 재등장 수까지 뽑아 빈도순으로 보여줍니다."
     )
 
     if pattern_summary_df.empty:
@@ -2047,7 +2259,10 @@ with tab5:
                 "- 합계 구간: 번호 6개의 합계를 10단위 또는 20단위 구간으로 묶어 봅니다.\n\n"
                 "- 연속번호/끝자리/소수/합성수/배수/나머지/간격 패턴: 조합의 모양이 과거에 얼마나 자주 나왔는지 보기 위한 기준입니다.\n\n"
                 "- 쏠림 종합 유형: 전부 홀수, 전부 짝수, 전부 저번호, 전부 고번호, 특정 구간 쏠림 같은 극단 패턴을 따로 표시합니다.\n\n"
-                "- 직전 회차 재등장 개수: 바로 전 회차 또는 최근 5~10회 범위에서 몇 개가 다시 등장했는지 봅니다."
+                "- 직전 본번호→본번호 재등장 개수: 바로 전 회차 본번호 6개 중 몇 개가 다음 회차 본번호로 다시 나왔는지 봅니다.\n\n"
+                "- 직전 보너스→본번호 재등장 여부: 직전 회차 보너스 번호가 다음 회차 본번호 6개 안에 들어왔는지 봅니다.\n\n"
+                "- 직전 본번호/보너스→보너스 재등장 여부: 직전 회차의 본번호 또는 보너스가 다음 회차 보너스로 다시 나왔는지 봅니다.\n\n"
+                "- 최근 2·3·5·10회 재등장 개수: 최근 여러 회차의 본번호/보너스 범위에서 현재 조합에 몇 개가 다시 등장했는지 봅니다."
             )
 
         with st.expander("회차별 원본 패턴 데이터 보기"):
@@ -2117,7 +2332,8 @@ with tab6:
             "2. 최근 흐름: 최근 N회 안에서 상대적으로 자주 나온 번호인지 봅니다.\n\n"
             "3. 미출현 간격: 평균 출현 간격 대비 최근에 얼마나 오래 안 나왔는지 봅니다.\n\n"
             "4. 보너스 출현: 보너스 번호로 자주 나온 정도를 약하게 반영합니다.\n\n"
-            "5. 조합 패턴: 홀짝, 저고, 5구간/3구간/십대 분포, 합계, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 3·5·7의 배수, 나머지, 번호 간격, 쏠림종합유형을 함께 봅니다. 전부 홀수/짝수 같은 극단값도 사전 배제하지 않습니다."
+            "5. 조합 패턴: 홀짝, 저고, 5구간/3구간/십대 분포, 합계, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 3·5·7의 배수, 나머지, 번호 간격, 쏠림종합유형을 함께 봅니다. 전부 홀수/짝수 같은 극단값도 사전 배제하지 않습니다.\n\n"
+            "6. 직전/최근 재등장 패턴: 직전 본번호 재등장, 직전 보너스 번호의 본번호 재등장, 최근 2·3·5·10회 본번호/보너스 재등장을 과거 빈도 기반으로 함께 봅니다."
         )
 
     st.subheader("AI 직접 조합 생성 옵션")
@@ -2221,6 +2437,7 @@ with tab6:
                 f"과거 조합 합계의 주요 범위: 약 {profile.get('sum_q25', 0):.0f} ~ {profile.get('sum_q75', 0):.0f}점, "
                 f"넓은 범위: 약 {profile.get('sum_q10', 0):.0f} ~ {profile.get('sum_q90', 0):.0f}점"
             )
+            st.write(f"최신 회차 본번호: {profile.get('latest_main_numbers', [])}, 보너스: {profile.get('latest_bonus_number', 'NA')}")
             st.write("과거 주요 패턴 빈도표 상위값:")
             st.text(profile.get("pattern_top_text", "패턴 빈도표 없음"))
 
