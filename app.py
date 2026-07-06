@@ -1,5 +1,6 @@
 import os
 import random
+import math
 import time
 import json
 import re
@@ -37,7 +38,7 @@ REQUEST_HEADERS = {
 }
 
 st.set_page_config(
-    page_title="통계 패턴 분석형 AI 로또 번호 분석/생성기 v8",
+    page_title="극단 패턴 보존형 AI 로또 번호 분석/생성기 v9",
     page_icon="🎲",
     layout="wide",
 )
@@ -528,29 +529,133 @@ def gap_pattern_label(gaps: List[int]) -> str:
     return "-".join(labels)
 
 
+def decade_label(n: int) -> str:
+    n = int(n)
+    if 1 <= n <= 9:
+        return "1자리"
+    if 10 <= n <= 19:
+        return "10대"
+    if 20 <= n <= 29:
+        return "20대"
+    if 30 <= n <= 39:
+        return "30대"
+    return "40대"
+
+
+def bucket_float_label(value: float, size: float, suffix: str = "") -> str:
+    value = float(value)
+    size = float(size)
+    start = math.floor(value / size) * size
+    end = start + size
+    if size >= 1:
+        return f"{int(start)}~{int(end - 1)}{suffix}"
+    return f"{start:.1f}~{end:.1f}{suffix}"
+
+
+def residue_distribution(nums: List[int], mod: int) -> str:
+    counts = [0 for _ in range(int(mod))]
+    for n in nums:
+        counts[int(n) % int(mod)] += 1
+    return "-".join(str(x) for x in counts)
+
+
+def binary_presence_label(counts: List[int]) -> str:
+    return "-".join("있음" if int(x) > 0 else "없음" for x in counts)
+
+
+def run_size_pattern(nums: List[int]) -> str:
+    nums = sorted([int(n) for n in nums])
+    groups = []
+    current = 1
+    for a, b in zip(nums, nums[1:]):
+        if b == a + 1:
+            current += 1
+        else:
+            groups.append(current)
+            current = 1
+    groups.append(current)
+    return "-".join(map(str, sorted(groups, reverse=True)))
+
+
+def concentration_label(features: Dict) -> str:
+    labels = []
+    if features.get("홀수개수") == 6:
+        labels.append("전부 홀수")
+    if features.get("짝수개수") == 6:
+        labels.append("전부 짝수")
+    if features.get("저번호개수") == 6:
+        labels.append("전부 저번호")
+    if features.get("고번호개수") == 6:
+        labels.append("전부 고번호")
+    if features.get("5구간최대쏠림", 0) >= 4:
+        labels.append(f"5구간 한쪽 {features.get('5구간최대쏠림')}개 쏠림")
+    if features.get("십대최대중복", 0) >= 4:
+        labels.append(f"십대 한쪽 {features.get('십대최대중복')}개 쏠림")
+    if not labels:
+        return "극단 쏠림 없음"
+    return " + ".join(labels)
+
+
 def combo_pattern_values_from_features(features: Dict) -> Dict[str, str]:
-    """조합 하나를 여러 종류의 패턴값으로 변환"""
+    """조합 하나를 가능한 한 다양한 패턴값으로 변환한다.
+
+    v9 핵심:
+    - 전부 홀수/전부 짝수, 전부 저번호/전부 고번호 같은 극단 패턴을 배제하지 않는다.
+    - 균형이 맞는지보다 실제 과거 데이터에서 해당 패턴이 얼마나 등장했는지로 판단한다.
+    - 너무 추상적인 2개 패턴이 아니라 합계, 구간, 간격, 끝자리, 소수/배수, 나머지, 쏠림 패턴까지 함께 본다.
+    """
     return {
         "홀짝 개수": f"홀수 {features['홀수개수']}개 / 짝수 {features['짝수개수']}개",
         "홀짝 순서(오름차순)": features["홀짝순서"],
+        "전체 홀짝 극단 여부": features["홀짝극단여부"],
         "저번호/고번호 개수": f"저번호 {features['저번호개수']}개 / 고번호 {features['고번호개수']}개",
         "저고 순서(오름차순)": features["저고순서"],
+        "전체 저고 극단 여부": features["저고극단여부"],
         "5구간 분포(1~9/10~19/20~29/30~39/40~45)": features["5구간분포"],
+        "5구간 존재 패턴": features["5구간존재패턴"],
+        "5구간 최대 쏠림": f"최대 {features['5구간최대쏠림']}개",
         "3구간 분포(1~15/16~30/31~45)": features["3구간분포"],
+        "3구간 존재 패턴": features["3구간존재패턴"],
+        "3구간 최대 쏠림": f"최대 {features['3구간최대쏠림']}개",
+        "십대 분포(1자리/10대/20대/30대/40대)": features["십대분포"],
+        "십대 존재 패턴": features["십대존재패턴"],
+        "십대 최대 중복": f"최대 {features['십대최대중복']}개",
+        "십대 종류 수": f"{features['십대종류수']}종류",
         "합계 10단위 구간": features["합계10구간"],
         "합계 20단위 구간": features["합계20구간"],
+        "합계 끝자리": f"{features['합계끝자리']}",
+        "합계 3나머지": f"{features['합계3나머지']}",
+        "합계 5나머지": f"{features['합계5나머지']}",
+        "평균값 5단위 구간": features["평균값5구간"],
+        "중앙값 5단위 구간": features["중앙값5구간"],
+        "표준편차 구간": features["표준편차구간"],
+        "번호범위폭 구간": features["범위폭구간"],
         "연속번호쌍 개수": f"{features['연속번호쌍']}쌍",
         "최대 연속 길이": f"{features['최대연속길이']}개 연속",
+        "연속 그룹 크기 패턴": features["연속그룹패턴"],
         "끝자리 최대 중복": f"최대 {features['같은끝자리최대']}개",
         "끝자리 종류 수": f"{features['끝자리종류수']}종류",
+        "끝자리 분포 최대값": f"최대 {features['끝자리최대분포']}개",
+        "끝자리 짝홀 개수": f"끝자리홀 {features['끝자리홀수개수']}개 / 끝자리짝 {features['끝자리짝수개수']}개",
+        "끝자리 합계 구간": features["끝자리합계구간"],
         "소수 개수": f"{features['소수개수']}개",
+        "합성수 개수": f"{features['합성수개수']}개",
+        "제곱수 개수": f"{features['제곱수개수']}개",
+        "피보나치 수 개수": f"{features['피보나치개수']}개",
         "3의 배수 개수": f"{features['3배수개수']}개",
         "5의 배수 개수": f"{features['5배수개수']}개",
+        "7의 배수 개수": f"{features['7배수개수']}개",
+        "3나머지 분포": features["3나머지분포"],
+        "5나머지 분포": features["5나머지분포"],
         "평균 간격 구간": features["평균간격구간"],
         "최대 간격 구간": features["최대간격구간"],
+        "최소 간격 구간": features["최소간격구간"],
         "간격 크기 패턴": features["간격패턴"],
+        "정확 간격 패턴": features["정확간격패턴"],
         "최소번호 구간": features["최소번호구간"],
         "최대번호 구간": features["최대번호구간"],
+        "최소-최대 구간 조합": features["최소최대구간조합"],
+        "쏠림 종합 유형": features["쏠림종합유형"],
     }
 
 
@@ -559,35 +664,51 @@ def summarize_combo_patterns(features: Dict) -> str:
         f"홀{features['홀수개수']}/짝{features['짝수개수']}, "
         f"저{features['저번호개수']}/고{features['고번호개수']}, "
         f"5구간 {features['5구간분포']}, "
+        f"십대 {features['십대분포']}, "
         f"합계 {features['합계']}, "
-        f"소수 {features['소수개수']}개, "
-        f"3배수 {features['3배수개수']}개, "
+        f"범위폭 {features['범위폭']}, "
+        f"소수 {features['소수개수']}개, 합성수 {features['합성수개수']}개, "
+        f"3배수 {features['3배수개수']}개, 5배수 {features['5배수개수']}개, "
         f"연속 {features['연속번호쌍']}쌍, "
-        f"끝자리최대 {features['같은끝자리최대']}개"
+        f"끝자리최대 {features['같은끝자리최대']}개, "
+        f"쏠림: {features['쏠림종합유형']}"
     )
 
 
 def make_pattern_analysis(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """과거 당첨 조합에서 다양한 패턴을 전부 뽑아 빈도순으로 정리"""
+    """과거 당첨 조합에서 다양한 패턴을 뽑아 빈도순으로 정리.
+
+    v9에서는 극단 패턴도 따로 빼지 않고 같은 테이블에서 빈도 기반으로 다룬다.
+    """
     rows = []
-    prev_nums = None
+    prev_draws = []
     for _, row in history_df.sort_values("회차", ascending=True).iterrows():
         nums = extract_main_numbers(row.to_dict())
         if len(nums) != 6:
             continue
         features = combo_basic_features(nums)
         pattern_values = combo_pattern_values_from_features(features)
-        if prev_nums is not None:
-            overlap = len(set(nums) & set(prev_nums))
-            pattern_values["전회차 번호 재등장 개수"] = f"{overlap}개"
+
+        if prev_draws:
+            prev1 = set(prev_draws[-1])
+            pattern_values["직전 1회 재등장 개수"] = f"{len(set(nums) & prev1)}개"
+            prev5 = set(x for draw in prev_draws[-5:] for x in draw)
+            prev10 = set(x for draw in prev_draws[-10:] for x in draw)
+            pattern_values["직전 5회 범위 재등장 개수"] = f"{len(set(nums) & prev5)}개"
+            pattern_values["직전 10회 범위 재등장 개수"] = f"{len(set(nums) & prev10)}개"
+        else:
+            pattern_values["직전 1회 재등장 개수"] = "이전회차 없음"
+            pattern_values["직전 5회 범위 재등장 개수"] = "이전회차 없음"
+            pattern_values["직전 10회 범위 재등장 개수"] = "이전회차 없음"
+
         for ptype, pvalue in pattern_values.items():
             rows.append({
                 "회차": int(row["회차"]),
                 "당첨번호": "-".join(map(str, sorted(nums))),
                 "패턴종류": ptype,
-                "패턴값": pvalue,
+                "패턴값": str(pvalue),
             })
-        prev_nums = nums
+        prev_draws.append(nums)
 
     raw_df = pd.DataFrame(rows)
     if raw_df.empty:
@@ -618,49 +739,40 @@ def make_pattern_maps(pattern_summary_df: pd.DataFrame) -> Dict[str, Dict[str, i
     return maps
 
 
+def make_pattern_totals(pattern_summary_df: pd.DataFrame) -> Dict[str, int]:
+    if pattern_summary_df is None or pattern_summary_df.empty:
+        return {}
+    return pattern_summary_df.groupby("패턴종류")["등장횟수"].sum().astype(int).to_dict()
+
+
 def score_pattern_value(pattern_maps: Dict[str, Dict[str, int]], ptype: str, pvalue: str) -> float:
     value_map = pattern_maps.get(ptype, {})
     if not value_map:
-        return 70.0
+        return 72.0
     max_count = max(value_map.values()) if value_map else 1
     count = int(value_map.get(str(pvalue), 0))
     if count <= 0:
-        return 52.0
-    # 가장 많이 나온 패턴은 100점, 드문 패턴도 완전히 0점 처리하지 않고 55점 이상 부여
-    return round(55.0 + 45.0 * (count / max(1, max_count)), 2)
+        # 등장하지 않은 패턴도 완전히 배제하지 않는다. 다만 과거 미관측 패턴이므로 낮은 참고점만 준다.
+        return 60.0
+    # v9: 극단 패턴이 희귀하더라도 탈락시키지 않기 위해 바닥점을 높인다.
+    # 최빈 패턴 100점, 관측된 희귀 패턴도 최소 68점.
+    return round(68.0 + 32.0 * (count / max(1, max_count)), 2)
 
 
 def calculate_pattern_score(features: Dict, profile: Dict) -> Tuple[float, Dict[str, float]]:
     pattern_maps = profile.get("pattern_maps", {}) if isinstance(profile, dict) else {}
     pattern_values = combo_pattern_values_from_features(features)
-    # 너무 세부적인 순서 패턴은 참고만 하고, 점수에는 대표 패턴 위주로 반영
-    scoring_types = [
-        "홀짝 개수",
-        "저번호/고번호 개수",
-        "5구간 분포(1~9/10~19/20~29/30~39/40~45)",
-        "3구간 분포(1~15/16~30/31~45)",
-        "합계 20단위 구간",
-        "연속번호쌍 개수",
-        "끝자리 최대 중복",
-        "끝자리 종류 수",
-        "소수 개수",
-        "3의 배수 개수",
-        "5의 배수 개수",
-        "평균 간격 구간",
-        "최대 간격 구간",
-        "최소번호 구간",
-        "최대번호 구간",
-    ]
+    # v9: 균형 패턴만 고르지 않고 실제 추출 가능한 모든 패턴을 점수에 넣는다.
+    # 너무 세부적인 패턴도 낮은 비중이 아니라 동일하게 참고하되, 바닥점이 높아 극단값이 배제되지 않는다.
     scores = {}
-    for ptype in scoring_types:
-        if ptype in pattern_values:
-            scores[ptype] = score_pattern_value(pattern_maps, ptype, pattern_values[ptype])
+    for ptype, pvalue in pattern_values.items():
+        scores[ptype] = score_pattern_value(pattern_maps, ptype, str(pvalue))
     if not scores:
-        return 70.0, {}
+        return 72.0, {}
     return round(sum(scores.values()) / len(scores), 2), scores
 
 
-def make_pattern_prompt_text(pattern_summary_df: pd.DataFrame, top_n_per_type: int = 5) -> str:
+def make_pattern_prompt_text(pattern_summary_df: pd.DataFrame, top_n_per_type: int = 8) -> str:
     if pattern_summary_df is None or pattern_summary_df.empty:
         return "패턴 빈도표 없음"
     lines = []
@@ -671,6 +783,27 @@ def make_pattern_prompt_text(pattern_summary_df: pd.DataFrame, top_n_per_type: i
     return "\n".join(lines)
 
 
+def pattern_support_summary(numbers: List[int], profile: Dict, top_n: int = 10) -> str:
+    """추천 조합의 패턴값이 과거에서 얼마나 등장했는지 간단히 보여주는 문장."""
+    try:
+        features = combo_basic_features(numbers)
+        pattern_values = combo_pattern_values_from_features(features)
+        pattern_maps = profile.get("pattern_maps", {})
+        pattern_totals = profile.get("pattern_totals", {})
+        rows = []
+        for ptype, pvalue in pattern_values.items():
+            count = int(pattern_maps.get(ptype, {}).get(str(pvalue), 0))
+            total = int(pattern_totals.get(ptype, 0))
+            pct = round(count / total * 100, 2) if total else 0.0
+            rows.append((ptype, str(pvalue), count, pct))
+        # 빈도 높은 패턴 일부 + 극단/쏠림 관련 패턴은 우선 표시
+        priority_words = ["극단", "쏠림", "홀짝 개수", "저번호/고번호", "5구간", "십대", "합계", "범위폭"]
+        rows.sort(key=lambda x: (not any(w in x[0] for w in priority_words), -x[2], x[0]))
+        return " / ".join([f"{ptype}={pvalue}({count}회,{pct}%)" for ptype, pvalue, count, pct in rows[:int(top_n)]])
+    except Exception:
+        return "패턴 빈도 계산 불가"
+
+
 def combo_basic_features(numbers: List[int]) -> Dict:
     nums = sorted([int(n) for n in numbers])
     odd_count = sum(1 for n in nums if n % 2 == 1)
@@ -678,36 +811,88 @@ def combo_basic_features(numbers: List[int]) -> Dict:
     gaps = [b - a for a, b in zip(nums, nums[1:])]
     avg_gap = sum(gaps) / len(gaps) if gaps else 0
     max_gap = max(gaps) if gaps else 0
+    min_gap = min(gaps) if gaps else 0
     range5_counts = count_by_ranges(nums, [(1, 9), (10, 19), (20, 29), (30, 39), (40, 45)])
     range3_counts = count_by_ranges(nums, [(1, 15), (16, 30), (31, 45)])
+    decade_counts = count_by_ranges(nums, [(1, 9), (10, 19), (20, 29), (30, 39), (40, 45)])
+    last_digits = [n % 10 for n in nums]
     total_sum = sum(nums)
-    return {
+    avg_value = total_sum / 6
+    median_value = (nums[2] + nums[3]) / 2
+    variance = sum((n - avg_value) ** 2 for n in nums) / 6
+    std_value = math.sqrt(variance)
+    number_span = max(nums) - min(nums)
+    composite_count = sum(1 for n in nums if n > 1 and n not in PRIME_NUMBERS)
+    square_numbers = {1, 4, 9, 16, 25, 36}
+    fibonacci_numbers = {1, 2, 3, 5, 8, 13, 21, 34}
+    end_digit_counts = Counter(last_digits)
+
+    base = {
         "합계": total_sum,
+        "평균값": round(avg_value, 2),
+        "중앙값": round(median_value, 2),
+        "표준편차": round(std_value, 2),
+        "범위폭": int(number_span),
         "홀수개수": odd_count,
         "짝수개수": 6 - odd_count,
         "홀짝순서": "-".join("홀" if n % 2 == 1 else "짝" for n in nums),
+        "홀짝극단여부": "전부 홀수" if odd_count == 6 else ("전부 짝수" if odd_count == 0 else "혼합"),
         "저번호개수": low_count,
         "고번호개수": 6 - low_count,
         "저고순서": "-".join("저" if n <= 22 else "고" for n in nums),
+        "저고극단여부": "전부 저번호" if low_count == 6 else ("전부 고번호" if low_count == 0 else "혼합"),
         "5구간분포": dist_label(range5_counts),
+        "5구간존재패턴": binary_presence_label(range5_counts),
+        "5구간최대쏠림": max(range5_counts) if range5_counts else 0,
         "3구간분포": dist_label(range3_counts),
+        "3구간존재패턴": binary_presence_label(range3_counts),
+        "3구간최대쏠림": max(range3_counts) if range3_counts else 0,
+        "십대분포": dist_label(decade_counts),
+        "십대존재패턴": binary_presence_label(decade_counts),
+        "십대최대중복": max(decade_counts) if decade_counts else 0,
+        "십대종류수": sum(1 for x in decade_counts if x > 0),
         "합계10구간": bucket_label(total_sum, 10),
         "합계20구간": bucket_label(total_sum, 20),
+        "합계끝자리": total_sum % 10,
+        "합계3나머지": total_sum % 3,
+        "합계5나머지": total_sum % 5,
+        "평균값5구간": bucket_float_label(avg_value, 5),
+        "중앙값5구간": bucket_float_label(median_value, 5),
+        "표준편차구간": bucket_float_label(std_value, 3),
+        "범위폭구간": bucket_label(number_span, 5),
         "연속번호쌍": count_consecutive_pairs(nums),
         "최대연속길이": max_consecutive_run(nums),
+        "연속그룹패턴": run_size_pattern(nums),
         "같은끝자리최대": max_same_last_digit(nums),
-        "끝자리종류수": len(set(n % 10 for n in nums)),
+        "끝자리종류수": len(set(last_digits)),
+        "끝자리최대분포": max(end_digit_counts.values()) if end_digit_counts else 0,
+        "끝자리홀수개수": sum(1 for d in last_digits if d % 2 == 1),
+        "끝자리짝수개수": sum(1 for d in last_digits if d % 2 == 0),
+        "끝자리합계": sum(last_digits),
+        "끝자리합계구간": bucket_label(sum(last_digits), 5),
         "소수개수": sum(1 for n in nums if n in PRIME_NUMBERS),
+        "합성수개수": composite_count,
+        "제곱수개수": sum(1 for n in nums if n in square_numbers),
+        "피보나치개수": sum(1 for n in nums if n in fibonacci_numbers),
         "3배수개수": sum(1 for n in nums if n % 3 == 0),
         "5배수개수": sum(1 for n in nums if n % 5 == 0),
+        "7배수개수": sum(1 for n in nums if n % 7 == 0),
+        "3나머지분포": residue_distribution(nums, 3),
+        "5나머지분포": residue_distribution(nums, 5),
         "평균간격": round(avg_gap, 2),
         "평균간격구간": gap_label(avg_gap),
         "최대간격": int(max_gap),
         "최대간격구간": gap_label(max_gap),
+        "최소간격": int(min_gap),
+        "최소간격구간": gap_label(min_gap),
         "간격패턴": gap_pattern_label(gaps),
+        "정확간격패턴": "-".join(map(str, gaps)),
         "최소번호구간": number_range_label(min(nums)),
         "최대번호구간": number_range_label(max(nums)),
+        "최소최대구간조합": f"{number_range_label(min(nums))}~{number_range_label(max(nums))}",
     }
+    base["쏠림종합유형"] = concentration_label(base)
+    return base
 
 
 def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
@@ -715,20 +900,26 @@ def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
     for _, row in history_df.iterrows():
         nums = extract_main_numbers(row.to_dict())
         if len(nums) == 6:
-            rows.append(combo_basic_features(nums))
+            one = combo_basic_features(nums)
+            one["회차"] = int(row["회차"])
+            one["당첨번호"] = "-".join(map(str, sorted(nums)))
+            rows.append(one)
     df = pd.DataFrame(rows)
     pattern_summary_df, _ = make_pattern_analysis(history_df)
     pattern_maps = make_pattern_maps(pattern_summary_df)
-    pattern_top_text = make_pattern_prompt_text(pattern_summary_df, top_n_per_type=5)
+    pattern_totals = make_pattern_totals(pattern_summary_df)
+    pattern_top_text = make_pattern_prompt_text(pattern_summary_df, top_n_per_type=8)
 
     if df.empty:
         return {
             "sum_q10": 90, "sum_q25": 105, "sum_q75": 170, "sum_q90": 190,
-            "common_odd_counts": [2, 3, 4],
-            "common_low_counts": [2, 3, 4],
+            "common_odd_counts": [0, 1, 2, 3, 4, 5, 6],
+            "common_low_counts": [0, 1, 2, 3, 4, 5, 6],
             "pattern_summary_df": pattern_summary_df,
             "pattern_maps": pattern_maps,
+            "pattern_totals": pattern_totals,
             "pattern_top_text": pattern_top_text,
+            "historical_feature_rows": [],
         }
     odd_common = df["홀수개수"].value_counts().index.astype(int).tolist()
     low_common = df["저번호개수"].value_counts().index.astype(int).tolist()
@@ -737,12 +928,14 @@ def make_historical_combo_profile(history_df: pd.DataFrame) -> Dict:
         "sum_q25": float(df["합계"].quantile(0.25)),
         "sum_q75": float(df["합계"].quantile(0.75)),
         "sum_q90": float(df["합계"].quantile(0.90)),
-        # 이제 상위 3개만이 아니라 실제 등장한 모든 개수 패턴을 빈도순으로 보관
-        "common_odd_counts": odd_common or [2, 3, 4],
-        "common_low_counts": low_common or [2, 3, 4],
+        # v9: 0개/6개 같은 극단 패턴도 실제로 등장했다면 그대로 보관한다.
+        "common_odd_counts": odd_common or [0, 1, 2, 3, 4, 5, 6],
+        "common_low_counts": low_common or [0, 1, 2, 3, 4, 5, 6],
         "pattern_summary_df": pattern_summary_df,
         "pattern_maps": pattern_maps,
+        "pattern_totals": pattern_totals,
         "pattern_top_text": pattern_top_text,
+        "historical_feature_rows": df.to_dict("records"),
     }
 
 
@@ -824,46 +1017,30 @@ def evaluate_statistical_combo(numbers: List[int], score_map: Dict[int, float], 
     features = combo_basic_features(nums)
     number_score = sum(float(score_map.get(n, 0)) for n in nums) / 6
 
-    total_sum = features["합계"]
-    if profile["sum_q25"] <= total_sum <= profile["sum_q75"]:
-        sum_score = 100
-    elif profile["sum_q10"] <= total_sum <= profile["sum_q90"]:
-        sum_score = 82
-    else:
-        sum_score = 58
-
     pattern_score, pattern_detail_scores = calculate_pattern_score(features, profile)
+
+    # v9 핵심 변경:
+    # - 합계가 IQR 밖이라고 무조건 감점하지 않음.
+    # - 죄다 홀수/짝수, 저번호 쏠림, 구간 쏠림, 연속번호 같은 패턴도 실제 과거 등장빈도로 판단.
+    # - 따라서 별도 균형 패널티 대신 전체 패턴 빈도점수를 강하게 반영.
+    sum_score = pattern_detail_scores.get("합계 20단위 구간", pattern_detail_scores.get("합계 10단위 구간", 72))
+    consecutive_score = pattern_detail_scores.get("연속번호쌍 개수", 72)
+    end_digit_score = pattern_detail_scores.get("끝자리 최대 중복", 72)
     odd_score = pattern_detail_scores.get("홀짝 개수", 72)
     low_score = pattern_detail_scores.get("저번호/고번호 개수", 72)
+    concentration_score = pattern_detail_scores.get("쏠림 종합 유형", 72)
 
-    consecutive_pairs = features["연속번호쌍"]
-    if consecutive_pairs <= 1:
-        consecutive_score = 100
-    elif consecutive_pairs == 2:
-        consecutive_score = 80
-    else:
-        consecutive_score = 55
-
-    if features["같은끝자리최대"] <= 2:
-        end_digit_score = 100
-    elif features["같은끝자리최대"] == 3:
-        end_digit_score = 78
-    else:
-        end_digit_score = 55
-
-    # v8: 번호 자체의 통계점수 + 합계 + 다양한 조합 패턴 빈도점수를 함께 반영
     combo_score = (
-        number_score * 0.60
-        + sum_score * 0.10
-        + pattern_score * 0.22
-        + consecutive_score * 0.04
-        + end_digit_score * 0.04
+        number_score * 0.50
+        + pattern_score * 0.42
+        + concentration_score * 0.08
     )
     details = {
         **features,
         "번호평균점수": round(number_score, 2),
         "합계균형점수": round(sum_score, 2),
         "패턴종합점수": round(pattern_score, 2),
+        "쏠림패턴점수": round(concentration_score, 2),
         "패턴상세점수": pattern_detail_scores,
         "패턴요약": summarize_combo_patterns(features),
         "홀짝균형점수": round(odd_score, 2),
@@ -874,7 +1051,7 @@ def evaluate_statistical_combo(numbers: List[int], score_map: Dict[int, float], 
     return round(combo_score, 2), details
 
 
-def build_combo_reason(numbers: List[int], stats_df: pd.DataFrame, recent_window: int) -> str:
+def build_combo_reason(numbers: List[int], stats_df: pd.DataFrame, recent_window: int, profile: Optional[Dict] = None) -> str:
     nums = sorted([int(n) for n in numbers])
     score_lookup = stats_df.set_index("번호")["통계점수"].to_dict()
     recent_col = f"최근{recent_window}회출현횟수"
@@ -882,11 +1059,119 @@ def build_combo_reason(numbers: List[int], stats_df: pd.DataFrame, recent_window
     avg_score = sum(score_lookup.get(n, 0) for n in nums) / 6
     recent_hits = int(stats_df[stats_df["번호"].isin(nums)][recent_col].sum()) if recent_col in stats_df.columns else 0
     features = combo_basic_features(nums)
+    support = pattern_support_summary(nums, profile or {}, top_n=5) if profile else ""
     return (
         f"통계점수 상위 번호 {top_nums} 중심, 조합 평균점수 {avg_score:.1f}, "
         f"최근 {recent_window}회 내 출현 누적 {recent_hits}회, "
         f"패턴: {summarize_combo_patterns(features)}"
+        + (f" / 과거빈도: {support}" if support else "")
     )
+
+
+def sample_weighted_numbers_from_pool(pool_numbers: List[int], score_map: Dict[int, float], k: int = 6) -> Tuple[int, ...]:
+    nums = sorted(set(int(n) for n in pool_numbers if 1 <= int(n) <= 45))
+    if len(nums) < k:
+        nums = list(range(1, 46))
+    weights = [max(1.0, float(score_map.get(n, 1.0))) ** 1.15 for n in nums]
+    return tuple(weighted_sample_without_replacement(nums, weights, k))
+
+
+def make_extreme_candidate_pools() -> List[Tuple[str, List[int]]]:
+    """극단/쏠림 패턴도 후보군에 일부러 포함시키기 위한 풀."""
+    pools = [
+        ("전부 홀수", [n for n in range(1, 46) if n % 2 == 1]),
+        ("전부 짝수", [n for n in range(1, 46) if n % 2 == 0]),
+        ("전부 저번호", [n for n in range(1, 23)]),
+        ("전부 고번호", [n for n in range(23, 46)]),
+        ("1~22 강한 쏠림", [n for n in range(1, 23)] + [n for n in range(1, 23)] + [n for n in range(23, 46)]),
+        ("23~45 강한 쏠림", [n for n in range(23, 46)] + [n for n in range(23, 46)] + [n for n in range(1, 23)]),
+        ("1~9 구간 쏠림", [n for n in range(1, 10)] + [n for n in range(1, 46)]),
+        ("10~19 구간 쏠림", [n for n in range(10, 20)] + [n for n in range(1, 46)]),
+        ("20~29 구간 쏠림", [n for n in range(20, 30)] + [n for n in range(1, 46)]),
+        ("30~39 구간 쏠림", [n for n in range(30, 40)] + [n for n in range(1, 46)]),
+        ("40~45 구간 쏠림", [n for n in range(40, 46)] + [n for n in range(1, 46)]),
+    ]
+    return pools
+
+
+def generate_candidate_from_historical_pattern(profile: Dict, score_map: Dict[int, float], max_attempts: int = 300) -> Tuple[int, ...]:
+    """과거 실제 당첨조합 하나의 패턴을 골라 비슷한 형태의 새 후보를 만든다.
+
+    완전히 같은 번호를 복사하는 것이 아니라 홀짝/저고/구간분포/쏠림 같은 모양을 맞추려고 시도한다.
+    """
+    rows = profile.get("historical_feature_rows", []) if isinstance(profile, dict) else []
+    if not rows:
+        return sample_weighted_numbers_from_pool(list(range(1, 46)), score_map)
+    target = random.choice(rows)
+    best_combo = None
+    best_match = -1
+    for _ in range(int(max_attempts)):
+        combo = sample_weighted_numbers_from_pool(list(range(1, 46)), score_map)
+        f = combo_basic_features(list(combo))
+        checks = [
+            f.get("홀수개수") == target.get("홀수개수"),
+            f.get("저번호개수") == target.get("저번호개수"),
+            f.get("5구간분포") == target.get("5구간분포"),
+            f.get("3구간분포") == target.get("3구간분포"),
+            f.get("쏠림종합유형") == target.get("쏠림종합유형"),
+            f.get("소수개수") == target.get("소수개수"),
+            f.get("3배수개수") == target.get("3배수개수"),
+            f.get("끝자리종류수") == target.get("끝자리종류수"),
+        ]
+        match_score = sum(1 for x in checks if x)
+        if match_score > best_match:
+            best_match = match_score
+            best_combo = combo
+        if match_score >= 5:
+            return combo
+    return best_combo or sample_weighted_numbers_from_pool(list(range(1, 46)), score_map)
+
+
+def pattern_family_key_from_row(row: Dict) -> str:
+    return "|".join([
+        str(row.get("홀짝", "")),
+        str(row.get("저고", "")),
+        str(row.get("구간분포5", "")),
+        str(row.get("연속번호쌍", "")),
+        str(row.get("끝자리최대중복", "")),
+        str(row.get("쏠림종합유형", "")),
+    ])
+
+
+def select_diverse_recommendations(rows: List[Dict], recommend_count: int) -> pd.DataFrame:
+    """점수 상위만 고르면 균형형 조합으로 쏠릴 수 있어 패턴가족이 다른 조합을 먼저 보존."""
+    if not rows:
+        return pd.DataFrame()
+    sorted_rows = sorted(rows, key=lambda r: float(r.get("조합통계점수", 0)), reverse=True)
+    selected = []
+    used_families = set()
+
+    # 1차: 서로 다른 패턴가족 우선
+    for row in sorted_rows:
+        key = pattern_family_key_from_row(row)
+        if key in used_families:
+            continue
+        selected.append(row)
+        used_families.add(key)
+        if len(selected) >= int(recommend_count):
+            break
+
+    # 2차: 부족하면 점수순으로 채움
+    if len(selected) < int(recommend_count):
+        existing = {tuple(row.get(f"번호{i}") for i in range(1, 7)) for row in selected}
+        for row in sorted_rows:
+            key_nums = tuple(row.get(f"번호{i}") for i in range(1, 7))
+            if key_nums in existing:
+                continue
+            selected.append(row)
+            existing.add(key_nums)
+            if len(selected) >= int(recommend_count):
+                break
+
+    df = pd.DataFrame(selected).sort_values("조합통계점수", ascending=False).reset_index(drop=True)
+    if not df.empty:
+        df["추천순위"] = range(1, len(df) + 1)
+    return df
 
 
 def generate_statistical_recommendations(
@@ -913,22 +1198,51 @@ def generate_statistical_recommendations(
     )
     profile = make_historical_combo_profile(history_df)
     pool_df = stats_df.head(int(top_pool_size)).copy()
-    numbers = pool_df["번호"].astype(int).tolist()
-    weights = [max(1.0, float(x)) ** 1.25 for x in pool_df["통계점수"].tolist()]
+    top_numbers = pool_df["번호"].astype(int).tolist()
+    all_numbers = list(range(1, 46))
     score_map = stats_df.set_index("번호")["통계점수"].to_dict()
 
     candidates = {}
     if include_top_six:
         top_six = tuple(sorted(stats_df.head(6)["번호"].astype(int).tolist()))
-        candidates[top_six] = True
+        candidates[top_six] = "통계점수 상위 6개"
 
     candidate_count = int(candidate_count)
-    for _ in range(candidate_count):
-        nums = tuple(weighted_sample_without_replacement(numbers, weights, 6))
-        candidates[nums] = True
+
+    # 1) 기존 방식: 통계점수 상위 풀 중심
+    for _ in range(max(10, candidate_count // 3)):
+        nums = sample_weighted_numbers_from_pool(top_numbers, score_map)
+        candidates[nums] = "상위 통계점수 풀"
+
+    # 2) 전체 1~45에서도 생성. 상위번호만 쓰다가 극단 패턴이 사라지는 문제 방지.
+    for _ in range(max(10, candidate_count // 4)):
+        nums = sample_weighted_numbers_from_pool(all_numbers, score_map)
+        candidates[nums] = "전체 1~45 패턴 보존"
+
+    # 3) 과거 실제 당첨조합의 패턴 형태를 복원해서 후보 생성.
+    for _ in range(max(10, candidate_count // 4)):
+        nums = generate_candidate_from_historical_pattern(profile, score_map, max_attempts=260)
+        candidates[nums] = "과거 실전 패턴 복원"
+
+    # 4) 전부 홀수/전부 짝수/저고 쏠림/구간 쏠림도 후보에 포함.
+    # 실제 점수화에서 낮으면 밀릴 수는 있지만, 처음부터 배제하지 않는다.
+    extreme_pools = make_extreme_candidate_pools()
+    for label, pool in extreme_pools:
+        for _ in range(max(2, candidate_count // max(60, len(extreme_pools) * 6))):
+            unique_pool = sorted(set(pool))
+            if len(unique_pool) >= 6:
+                nums = sample_weighted_numbers_from_pool(unique_pool, score_map)
+                candidates[nums] = label
+
+    # 5) 부족하면 보충
+    safety = 0
+    while len(candidates) < max(candidate_count, recommend_count * 20) and safety < candidate_count * 2:
+        nums = sample_weighted_numbers_from_pool(all_numbers, score_map)
+        candidates[nums] = "보충 후보"
+        safety += 1
 
     rows = []
-    for combo in candidates.keys():
+    for combo, source_label in candidates.items():
         score, details = evaluate_statistical_combo(list(combo), score_map, profile)
         nums = list(combo)
         rows.append({
@@ -939,26 +1253,34 @@ def generate_statistical_recommendations(
             "번호4": nums[3],
             "번호5": nums[4],
             "번호6": nums[5],
+            "후보생성방식": source_label,
             "조합통계점수": score,
             "합계": details["합계"],
             "홀짝": f"{details['홀수개수']}:{details['짝수개수']}",
+            "홀짝극단": details["홀짝극단여부"],
             "저고": f"{details['저번호개수']}:{details['고번호개수']}",
+            "저고극단": details["저고극단여부"],
             "구간분포5": details["5구간분포"],
+            "십대분포": details["십대분포"],
+            "쏠림종합유형": details["쏠림종합유형"],
+            "범위폭": details["범위폭"],
+            "표준편차": details["표준편차"],
             "소수개수": details["소수개수"],
+            "합성수개수": details["합성수개수"],
             "3배수개수": details["3배수개수"],
             "5배수개수": details["5배수개수"],
+            "7배수개수": details["7배수개수"],
             "연속번호쌍": details["연속번호쌍"],
             "끝자리최대중복": details["같은끝자리최대"],
             "패턴종합점수": details["패턴종합점수"],
+            "쏠림패턴점수": details["쏠림패턴점수"],
             "패턴요약": details["패턴요약"],
-            "추천이유": build_combo_reason(nums, stats_df, recent_window),
+            "주요패턴빈도": pattern_support_summary(nums, profile, top_n=8),
+            "추천이유": build_combo_reason(nums, stats_df, recent_window, profile),
         })
 
-    reco_df = pd.DataFrame(rows).sort_values("조합통계점수", ascending=False).head(int(recommend_count)).reset_index(drop=True)
-    if not reco_df.empty:
-        reco_df["추천순위"] = range(1, len(reco_df) + 1)
+    reco_df = select_diverse_recommendations(rows, int(recommend_count))
     return reco_df, stats_df, profile
-
 
 
 def combo_numbers_from_reco_row(row: Dict) -> List[int]:
@@ -997,12 +1319,22 @@ def make_combo_numeric_detail_df(reco_df: pd.DataFrame, stats_df: pd.DataFrame, 
             "평균미출현간격비율": round(float(selected["미출현간격비율"].mean()), 2) if "미출현간격비율" in selected.columns else 0,
             "합계": row.get("합계", 0),
             "홀짝": row.get("홀짝", ""),
+            "홀짝극단": row.get("홀짝극단", ""),
             "저고": row.get("저고", ""),
+            "저고극단": row.get("저고극단", ""),
             "구간분포5": row.get("구간분포5", ""),
+            "십대분포": row.get("십대분포", ""),
+            "쏠림종합유형": row.get("쏠림종합유형", ""),
+            "범위폭": row.get("범위폭", ""),
+            "표준편차": row.get("표준편차", ""),
             "소수개수": row.get("소수개수", ""),
+            "합성수개수": row.get("합성수개수", ""),
             "3배수개수": row.get("3배수개수", ""),
             "5배수개수": row.get("5배수개수", ""),
+            "7배수개수": row.get("7배수개수", ""),
             "패턴종합점수": row.get("패턴종합점수", ""),
+            "쏠림패턴점수": row.get("쏠림패턴점수", ""),
+            "주요패턴빈도": row.get("주요패턴빈도", ""),
             "패턴요약": row.get("패턴요약", ""),
             "연속번호쌍": row.get("연속번호쌍", 0),
             "끝자리최대중복": row.get("끝자리최대중복", 0),
@@ -1210,7 +1542,7 @@ def ai_items_to_reco_df(items: List[Dict], stats_df: pd.DataFrame, profile: Dict
     for item in items:
         nums = sorted(item["numbers"])
         score, details = evaluate_statistical_combo(nums, score_map, profile)
-        numeric_reason = build_combo_reason(nums, stats_df, recent_window)
+        numeric_reason = build_combo_reason(nums, stats_df, recent_window, profile)
         rows.append({
             "추천순위": 0,
             "번호1": nums[0],
@@ -1223,14 +1555,24 @@ def ai_items_to_reco_df(items: List[Dict], stats_df: pd.DataFrame, profile: Dict
             "합계": details["합계"],
             "홀짝": f"{details['홀수개수']}:{details['짝수개수']}",
             "저고": f"{details['저번호개수']}:{details['고번호개수']}",
+            "홀짝극단": details["홀짝극단여부"],
+            "저고극단": details["저고극단여부"],
             "구간분포5": details["5구간분포"],
+            "십대분포": details["십대분포"],
+            "쏠림종합유형": details["쏠림종합유형"],
+            "범위폭": details["범위폭"],
+            "표준편차": details["표준편차"],
             "소수개수": details["소수개수"],
+            "합성수개수": details["합성수개수"],
             "3배수개수": details["3배수개수"],
             "5배수개수": details["5배수개수"],
+            "7배수개수": details["7배수개수"],
             "연속번호쌍": details["연속번호쌍"],
             "끝자리최대중복": details["같은끝자리최대"],
             "패턴종합점수": details["패턴종합점수"],
+            "쏠림패턴점수": details["쏠림패턴점수"],
             "패턴요약": details["패턴요약"],
+            "주요패턴빈도": pattern_support_summary(nums, profile, top_n=8),
             "AI전략": item.get("strategy", "AI 통계 조합"),
             "AI추천이유": item.get("reason", ""),
             "수치추천이유": numeric_reason,
@@ -1276,7 +1618,7 @@ def ask_nvidia_make_recommendations(
 
     prompt = f"""
 너는 로또 통계표를 읽고 참고용 조합을 구성하는 AI야.
-당첨을 예측하거나 보장하면 안 된다. 통계적으로 균형 있는 참고 조합만 만들어라.
+당첨을 예측하거나 보장하면 안 된다. 통계적으로 관측된 패턴을 참고하되, 균형형만 고집하지 말고 극단/쏠림 패턴도 실제 등장빈도에 따라 후보로 인정하라.
 
 [조건]
 - 만들어야 할 조합 수: {int(recommend_count)}개
@@ -1284,10 +1626,10 @@ def ask_nvidia_make_recommendations(
 - 한 조합 안에서 중복 금지
 - 가능하면 아래 통계점수 상위 {int(candidate_pool_size)}개 번호를 중심으로 구성
 - 모든 조합이 너무 비슷하지 않게 분산
-- 합계는 과거 IQR(Q25~Q75) 근처를 우선 고려하되, 무리하게 맞추지 않음
+- 합계는 과거 분포를 참고하되 IQR 밖이라고 자동 제외하지 않는다
 - 패턴은 홀짝/저고 2가지만 보지 말고, 아래 패턴 빈도표 전체를 참고
-- 홀수만 있거나 저번호만 있는 극단 패턴도 실제 등장 빈도에 따라 판단
-- 5구간 분포, 3구간 분포, 연속번호, 끝자리, 소수, 3의 배수, 5의 배수, 간격 패턴까지 함께 고려
+- 전부 홀수, 전부 짝수, 전부 저번호, 전부 고번호, 특정 구간 쏠림도 실제 과거 등장 빈도에 따라 판단하고 절대 사전 배제하지 않는다
+- 5구간/3구간/십대분포, 합계, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 배수, 나머지, 간격, 쏠림종합유형까지 함께 고려한다
 - 단, 가장 흔한 패턴만 복사하지 말고 조합끼리는 서로 다르게 분산
 
 [기본 정보]
@@ -1376,7 +1718,7 @@ def ask_nvidia_ai(api_key, generated_numbers, pool_df, latest_draw, verification
 # =========================================================
 # 화면
 # =========================================================
-st.title("🎲 통계 패턴 분석형 AI 로또 번호 분석/생성기 v8")
+st.title("🎲 극단 패턴 보존형 AI 로또 번호 분석/생성기 v9")
 st.write("mirror 데이터를 빠르게 불러오고 내부 무결성 검사를 기본 적용합니다. 공식 API 검증은 동행복권 사이트가 클라우드 접속을 차단할 수 있어 선택 기능으로 제공합니다.")
 
 st.warning(
@@ -1659,8 +2001,8 @@ with tab4:
 with tab5:
     st.header("🧩 과거 당첨 조합 패턴 분석")
     st.write(
-        "홀짝/저고만 보는 것이 아니라, 구간분포, 합계구간, 연속번호, 끝자리, 소수, 배수, 간격, "
-        "전회차 재등장 수까지 여러 패턴을 뽑아 실제 과거 데이터에서 자주 등장한 순서로 보여줍니다."
+        "홀짝/저고만 보는 것이 아니라, 전부 홀수·전부 짝수·전부 저번호·전부 고번호 같은 극단 패턴, "
+        "구간 쏠림, 합계구간, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 배수, 나머지, 간격, 직전 회차 재등장 수까지 뽑아 빈도순으로 보여줍니다."
     )
 
     if pattern_summary_df.empty:
@@ -1703,8 +2045,9 @@ with tab5:
                 "- 5구간 분포: 1~9 / 10~19 / 20~29 / 30~39 / 40~45에 각각 몇 개가 들어갔는지 봅니다. 예: 1-2-1-1-1\n\n"
                 "- 3구간 분포: 1~15 / 16~30 / 31~45에 각각 몇 개가 들어갔는지 봅니다.\n\n"
                 "- 합계 구간: 번호 6개의 합계를 10단위 또는 20단위 구간으로 묶어 봅니다.\n\n"
-                "- 연속번호/끝자리/소수/배수/간격 패턴: 조합의 모양이 과거에 얼마나 자주 나왔는지 보기 위한 보조 기준입니다.\n\n"
-                "- 전회차 번호 재등장 개수: 바로 전 회차 당첨번호 중 몇 개가 다음 회차에 다시 등장했는지 봅니다."
+                "- 연속번호/끝자리/소수/합성수/배수/나머지/간격 패턴: 조합의 모양이 과거에 얼마나 자주 나왔는지 보기 위한 기준입니다.\n\n"
+                "- 쏠림 종합 유형: 전부 홀수, 전부 짝수, 전부 저번호, 전부 고번호, 특정 구간 쏠림 같은 극단 패턴을 따로 표시합니다.\n\n"
+                "- 직전 회차 재등장 개수: 바로 전 회차 또는 최근 5~10회 범위에서 몇 개가 다시 등장했는지 봅니다."
             )
 
         with st.expander("회차별 원본 패턴 데이터 보기"):
@@ -1714,7 +2057,7 @@ with tab6:
     st.header("📈 최근 결과 + 통계 기반 추천 조합")
     st.warning(
         "이 기능은 '가장 당첨될 것 같은 번호'를 보장하는 기능이 아닙니다. "
-        "장기 빈도, 최근 흐름, 미출현 간격, 보너스 출현, 조합 균형을 점수화해 참고용 조합을 추천합니다. "
+        "장기 빈도, 최근 흐름, 미출현 간격, 보너스 출현, 실제 과거 조합 패턴 빈도를 점수화해 참고용 조합을 추천합니다. 균형형만 강제로 고르지 않고 극단/쏠림 패턴도 후보에서 배제하지 않습니다. "
         "로또는 매회 독립적인 무작위 추첨입니다."
     )
 
@@ -1774,7 +2117,7 @@ with tab6:
             "2. 최근 흐름: 최근 N회 안에서 상대적으로 자주 나온 번호인지 봅니다.\n\n"
             "3. 미출현 간격: 평균 출현 간격 대비 최근에 얼마나 오래 안 나왔는지 봅니다.\n\n"
             "4. 보너스 출현: 보너스 번호로 자주 나온 정도를 약하게 반영합니다.\n\n"
-            "5. 조합 패턴: 홀짝, 저고, 5구간/3구간 분포, 합계구간, 연속번호, 끝자리, 소수, 3의 배수, 5의 배수, 번호 간격 패턴을 함께 봅니다."
+            "5. 조합 패턴: 홀짝, 저고, 5구간/3구간/십대 분포, 합계, 표준편차, 범위폭, 연속번호, 끝자리, 소수/합성수, 3·5·7의 배수, 나머지, 번호 간격, 쏠림종합유형을 함께 봅니다. 전부 홀수/짝수 같은 극단값도 사전 배제하지 않습니다."
         )
 
     st.subheader("AI 직접 조합 생성 옵션")
